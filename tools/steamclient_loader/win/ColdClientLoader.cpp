@@ -46,6 +46,11 @@ const static DWORD UserId = 0x03100004771F810D & 0xffffffff;
 const static DWORD ProcessID = GetCurrentProcessId();
 
 static std::string IniFile{};
+// custom: folder containing IniFile - used as the base for resolving all
+// relative paths in the ini, and for GseAppPath/SteamPath, so a single
+// shared loader binary (e.g. launched from a central location) still
+// resolves everything relative to the per-game config it was pointed at
+static std::string IniDir{};
 static std::string ClientPath{};
 static std::string Client64Path{};
 static std::string ExeFile{};
@@ -438,11 +443,14 @@ static void set_steam_env_vars()
 
     SetEnvironmentVariableW(L"SteamClientLaunch", L"1");
     SetEnvironmentVariableW(L"SteamEnv", L"1");
-    SetEnvironmentVariableW(L"SteamPath", common_helpers::to_wstr(pe_helpers::get_current_exe_path()).c_str());
-    // custom: let the emu find steam_settings next to this loader/ini even when
+    // custom: use IniDir (the per-game config folder) instead of the loader
+    // exe's own folder, so this still works when the loader binary itself is
+    // a shared/central copy pointed at a game via a command line argument
+    SetEnvironmentVariableW(L"SteamPath", common_helpers::to_wstr(IniDir).c_str());
+    // custom: let the emu find steam_settings next to the ini (IniDir) even when
     // steamclient64.dll itself is loaded from a central, shared location
     // (see dll/base.cpp get_full_program_path(), checks GseAppPath first)
-    SetEnvironmentVariableW(L"GseAppPath", common_helpers::to_wstr(pe_helpers::get_current_exe_path()).c_str());
+    SetEnvironmentVariableW(L"GseAppPath", common_helpers::to_wstr(IniDir).c_str());
 }
 
 
@@ -504,10 +512,30 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         logger.write("Searching for configuration file: " + IniFile);
     }
 
+    // custom: allow a shared/central loader binary to be pointed at a
+    // specific game's ini via the first command line argument, e.g. from a
+    // shortcut: steamclient_loader_x64.exe "D:\Games\MyGame\loader\ColdClientLoader.ini"
+    if (lpCmdLine && lpCmdLine[0]) {
+        std::wstring cmd_arg(lpCmdLine);
+        if (cmd_arg.size() >= 2 && cmd_arg.front() == L'"' && cmd_arg.back() == L'"') {
+            cmd_arg = cmd_arg.substr(1, cmd_arg.size() - 2);
+        }
+        std::string candidate = common_helpers::to_str(cmd_arg);
+        if (common_helpers::file_exist(candidate)) {
+            IniFile = candidate;
+            logger.write("Using configuration file from command line: " + IniFile);
+        }
+    }
+
     if (!common_helpers::file_exist(IniFile)) {
         logger.write("Couldn't find the configuration file");
         MessageBoxA(NULL, "Couldn't find the configuration file.", "ColdClientLoader", MB_ICONERROR);
         return 1;
+    }
+
+    IniDir = std::filesystem::u8path(IniFile).parent_path().u8string();
+    if (IniDir.empty() || IniDir.back() != '\\') {
+        IniDir.append("\\");
     }
 
     {
@@ -528,21 +556,24 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         }
     }
 
+    // custom: resolve relative ini paths against the ini's own folder (IniDir)
+    // instead of the loader exe's folder, so a shared/central loader binary
+    // still resolves each game's paths correctly
     ClientPath = common_helpers::to_absolute(
         local_ini.GetValue("SteamClient", "SteamClientDll", ""),
-        pe_helpers::get_current_exe_path()
+        IniDir
     );
     Client64Path = common_helpers::to_absolute(
         local_ini.GetValue("SteamClient", "SteamClient64Dll", ""),
-        pe_helpers::get_current_exe_path()
+        IniDir
     );
     ExeFile = common_helpers::to_absolute(
         local_ini.GetValue("SteamClient", "Exe", ""),
-        pe_helpers::get_current_exe_path()
+        IniDir
     );
     ExeRunDir = common_helpers::to_absolute(
         local_ini.GetValue("SteamClient", "ExeRunDir", ""),
-        pe_helpers::get_current_exe_path()
+        IniDir
     );
     ExeCommandLine = local_ini.GetValue("SteamClient", "ExeCommandLine", "");
     AppId = local_ini.GetValue("SteamClient", "AppId", "");
@@ -552,7 +583,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     ForceInjectGameOverlayRenderer = local_ini.GetBoolValue("Injection", "ForceInjectGameOverlayRenderer", false);
     DllsToInjectFolder = common_helpers::to_absolute(
         local_ini.GetValue("Injection", "DllsToInjectFolder", ""),
-        pe_helpers::get_current_exe_path()
+        IniDir
     );
     IgnoreInjectionError = local_ini.GetBoolValue("Injection", "IgnoreInjectionError", true);
     IgnoreLoaderArchDifference = local_ini.GetBoolValue("Injection", "IgnoreLoaderArchDifference", false);
