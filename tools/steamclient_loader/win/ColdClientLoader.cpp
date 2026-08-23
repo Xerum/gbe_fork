@@ -515,6 +515,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     // custom: allow a shared/central loader binary to be pointed at a
     // specific game's ini via the first command line argument, e.g. from a
     // shortcut: steamclient_loader_x64.exe "D:\Games\MyGame\loader\ColdClientLoader.ini"
+    // once consumed here, this argument must NOT also be forwarded to the
+    // spawned game/server exe further below (see ini_path_from_cmdline)
+    bool ini_path_from_cmdline = false;
     if (lpCmdLine && lpCmdLine[0]) {
         std::wstring cmd_arg(lpCmdLine);
         if (cmd_arg.size() >= 2 && cmd_arg.front() == L'"' && cmd_arg.back() == L'"') {
@@ -523,6 +526,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         std::string candidate = common_helpers::to_str(cmd_arg);
         if (common_helpers::file_exist(candidate)) {
             IniFile = candidate;
+            ini_path_from_cmdline = true;
             logger.write("Using configuration file from command line: " + IniFile);
         }
     }
@@ -837,7 +841,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         logger.write("spawning the requested EXE file");
         const auto exe_file = common_helpers::to_wstr(ExeFile);
         std::wstringstream cmdline{};
-        cmdline << L"\"" << exe_file << L"\" " << common_helpers::to_wstr(ExeCommandLine) << L" " << lpCmdLine;
+        cmdline << L"\"" << exe_file << L"\" " << common_helpers::to_wstr(ExeCommandLine);
+        // custom: don't forward lpCmdLine to the spawned exe when it was
+        // consumed above as the shared-loader ini path override - otherwise
+        // the ini path leaks into the game's own args (e.g. UE reads a stray
+        // positional arg as a map/world name)
+        if (!ini_path_from_cmdline) {
+            cmdline << L" " << lpCmdLine;
+        }
         auto CommandLine = cmdline.str();
         if (!CreateProcessW(exe_file.c_str(), (LPWSTR)CommandLine.c_str(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, common_helpers::to_wstr(ExeRunDir).c_str(), &info, &processInfo)) {
             logger.write("Unable to load the requested EXE file, error = " + std::to_string(GetLastError()));
