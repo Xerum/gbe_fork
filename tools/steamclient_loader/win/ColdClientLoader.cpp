@@ -439,6 +439,10 @@ static void set_steam_env_vars()
     SetEnvironmentVariableW(L"SteamClientLaunch", L"1");
     SetEnvironmentVariableW(L"SteamEnv", L"1");
     SetEnvironmentVariableW(L"SteamPath", common_helpers::to_wstr(pe_helpers::get_current_exe_path()).c_str());
+    // custom: let the emu find steam_settings next to this loader/ini even when
+    // steamclient64.dll itself is loaded from a central, shared location
+    // (see dll/base.cpp get_full_program_path(), checks GseAppPath first)
+    SetEnvironmentVariableW(L"GseAppPath", common_helpers::to_wstr(pe_helpers::get_current_exe_path()).c_str());
 }
 
 
