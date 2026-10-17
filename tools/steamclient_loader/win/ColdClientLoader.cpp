@@ -515,25 +515,52 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     // custom: allow a shared/central loader binary to be pointed at a
     // specific game's ini via the first command line argument, e.g. from a
     // shortcut: steamclient_loader_x64.exe "D:\Games\MyGame\loader\ColdClientLoader.ini"
+    // the argument may also be a folder containing ColdClientLoader.ini, and a
+    // relative path is tried against the loader exe's folder as well, so the
+    // per-game folder name alone works: steamclient_loader_x64.exe 1203620
     // once consumed here, this argument must NOT also be forwarded to the
     // spawned game/server exe further below (see ini_path_from_cmdline)
     bool ini_path_from_cmdline = false;
+    std::string cmdline_arg{};
     if (lpCmdLine && lpCmdLine[0]) {
         std::wstring cmd_arg(lpCmdLine);
+        cmd_arg.erase(0, cmd_arg.find_first_not_of(L" \t"));
+        cmd_arg.erase(cmd_arg.find_last_not_of(L" \t") + 1);
         if (cmd_arg.size() >= 2 && cmd_arg.front() == L'"' && cmd_arg.back() == L'"') {
             cmd_arg = cmd_arg.substr(1, cmd_arg.size() - 2);
         }
-        std::string candidate = common_helpers::to_str(cmd_arg);
-        if (common_helpers::file_exist(candidate)) {
-            IniFile = candidate;
-            ini_path_from_cmdline = true;
-            logger.write("Using configuration file from command line: " + IniFile);
+        cmdline_arg = common_helpers::to_str(cmd_arg);
+
+        std::vector<std::string> candidates{ cmdline_arg };
+        if (!std::filesystem::u8path(cmdline_arg).is_absolute()) {
+            candidates.push_back(common_helpers::to_absolute(cmdline_arg, pe_helpers::get_current_exe_path()));
+        }
+        for (const auto &candidate : candidates) {
+            std::string ini_candidate{};
+            if (common_helpers::file_exist(candidate)) {
+                ini_candidate = candidate;
+            } else if (common_helpers::dir_exist(candidate)) {
+                ini_candidate = (std::filesystem::u8path(candidate) / std::filesystem::u8path("ColdClientLoader.ini")).u8string();
+                if (!common_helpers::file_exist(ini_candidate)) {
+                    ini_candidate.clear();
+                }
+            }
+            if (!ini_candidate.empty()) {
+                IniFile = ini_candidate;
+                ini_path_from_cmdline = true;
+                logger.write("Using configuration file from command line: " + IniFile);
+                break;
+            }
         }
     }
 
     if (!common_helpers::file_exist(IniFile)) {
         logger.write("Couldn't find the configuration file");
-        MessageBoxA(NULL, "Couldn't find the configuration file.", "ColdClientLoader", MB_ICONERROR);
+        std::string msg = "Couldn't find the configuration file.";
+        if (!cmdline_arg.empty()) {
+            msg += "\n\nArgument: " + cmdline_arg;
+        }
+        MessageBoxA(NULL, msg.c_str(), "ColdClientLoader", MB_ICONERROR);
         return 1;
     }
 
