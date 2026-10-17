@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
+#include <tlhelp32.h>
 
 
 static CSimpleIniA local_ini{true};
@@ -159,6 +160,106 @@ static std::vector<std::string> collect_dlls_to_inject(const bool is_exe_32, std
     }
 }
 
+// custom: the registry values below are saved on start and restored on exit.
+// a second loader started while the first one is still running (e.g. a
+// dedicated server + its client) would save the first loader's values as the
+// "originals", and a killed loader never restores anything. both leave Steam's
+// entries (including the steam:// handler) pointing to the loader for good.
+// so: saved values that point to a loader get replaced by Steam's real ones,
+// and only the last running loader restores the registry.
+
+static bool points_to_loader(std::wstring value)
+{
+    if (value.empty()) return false;
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    for (const auto &dll : { ClientPath, Client64Path }) {
+        if (dll.size() && common_helpers::str_cmp_insensitive(value, common_helpers::to_wstr(dll))) return true;
+    }
+    auto loader_dir = common_helpers::to_wstr(pe_helpers::get_current_exe_path()); // with trailing '\\'
+    if (common_helpers::str_cmp_insensitive(value, loader_dir.substr(0, loader_dir.size() - 1))) return true;
+    auto value_upper = common_helpers::to_upper(value);
+    return value_upper.find(common_helpers::to_upper(loader_dir)) != std::wstring::npos;
+}
+
+static std::wstring read_reg_sz(HKEY root, const wchar_t *subkey, const wchar_t *value)
+{
+    WCHAR buf[8192] = { 0 };
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(root, subkey, value, RRF_RT_REG_SZ, NULL, buf, &size) != ERROR_SUCCESS) return {};
+    return buf;
+}
+
+constexpr static const wchar_t LOADER_REG_KEY[] = L"Software\\GSE\\ColdClientLoader";
+
+// Steam's install folder without a trailing '\\', taken from the first entry that
+// doesn't point to a loader, empty if none was found
+static const std::wstring& get_real_steam_dir()
+{
+    static std::wstring steam_dir{};
+    static bool searched = false;
+    if (searched) return steam_dir;
+    searched = true;
+
+    auto exe_dir = [](const std::wstring &exe) {
+        return exe.empty() ? std::wstring() : std::filesystem::path(exe).parent_path().wstring();
+    };
+    std::wstring handler_exe = read_reg_sz(HKEY_CLASSES_ROOT, L"steam\\Shell\\Open\\Command", L"");
+    if (handler_exe.size() && handler_exe.front() == L'"') {
+        handler_exe = handler_exe.substr(1, handler_exe.find(L'"', 1) - 1);
+    }
+    const std::wstring last_known = read_reg_sz(HKEY_CURRENT_USER, LOADER_REG_KEY, L"SteamDir");
+    const std::wstring candidates[] = {
+        exe_dir(read_reg_sz(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamExe")),
+        read_reg_sz(HKEY_LOCAL_MACHINE, hklm_path.c_str(), L"InstallPath"),
+        exe_dir(handler_exe),
+        last_known,
+    };
+    for (const auto &candidate : candidates) {
+        if (candidate.empty() || points_to_loader(candidate)) continue;
+        auto dir = std::filesystem::path(candidate).make_preferred().wstring();
+        while (dir.size() && dir.back() == L'\\') dir.pop_back();
+        if (!common_helpers::file_exist(std::filesystem::path(dir) / L"steam.exe")) continue;
+
+        steam_dir = dir;
+        if (!common_helpers::str_cmp_insensitive(steam_dir, last_known)) {
+            HKEY key = { 0 };
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, LOADER_REG_KEY, 0, 0, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &key, NULL) == ERROR_SUCCESS) {
+                RegSetValueExW(key, L"SteamDir", NULL, REG_SZ, (const BYTE *)steam_dir.c_str(), static_cast<DWORD>((steam_dir.size() + 1) * sizeof(WCHAR)));
+                RegCloseKey(key);
+            }
+        }
+        break;
+    }
+    logger.write(L"Real Steam folder: '" + steam_dir + L"'");
+    return steam_dir;
+}
+
+// replaces a saved original value that points to a loader, returns true if it did
+template<size_t N>
+static bool replace_loader_value(WCHAR (&saved)[N], DWORD &size, const std::wstring &replacement)
+{
+    if (replacement.empty() || !points_to_loader(saved)) return false;
+    wcsncpy_s(saved, N, replacement.c_str(), _TRUNCATE);
+    size = static_cast<DWORD>((wcslen(saved) + 1) * sizeof(WCHAR));
+    logger.write(L"Saved registry value pointed to a loader, will restore '" + replacement + L"' instead");
+    return true;
+}
+
+static bool other_loader_running()
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W entry = { 0 };
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+    for (BOOL ok = Process32FirstW(snapshot, &entry); ok && !found; ok = Process32NextW(snapshot, &entry)) {
+        if (entry.th32ProcessID == ProcessID) continue;
+        found = _wcsnicmp(entry.szExeFile, L"steamclient_loader", 18) == 0;
+    }
+    CloseHandle(snapshot);
+    return found;
+}
+
 static bool orig_steam_hkcu = false;
 static WCHAR OrgSteamCDir_hkcu[8192] = { 0 };
 static DWORD Size1_hkcu = sizeof(OrgSteamCDir_hkcu);
@@ -183,6 +284,16 @@ static bool patch_registry_hkcu()
         RegQueryValueExW(Registrykey, L"pid", 0, &keyType, (LPBYTE)&OrgSteamPid_hkcu, &SizePid_hkcu);
         RegQueryValueExW(Registrykey, L"Universe", 0, &keyType, (LPBYTE)OrgSteamUniverse_hkcu, &Size4_hkcu);
         logger.write("Found previous registry entry (HKCU) for Steam");
+        // custom: left behind by another loader, restore what a closed Steam leaves there
+        const auto &steam_dir = get_real_steam_dir();
+        if (steam_dir.size()) {
+            bool from_loader = replace_loader_value(OrgSteamCDir_hkcu, Size1_hkcu, steam_dir + L"\\steamclient.dll");
+            from_loader = replace_loader_value(OrgSteamCDir64_hkcu, Size2_hkcu, steam_dir + L"\\steamclient64.dll") || from_loader;
+            if (from_loader) {
+                OrgSteamActiveUser_hkcu = 0;
+                OrgSteamPid_hkcu = 0;
+            }
+        }
     } else if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", 0, 0, REG_OPTION_NON_VOLATILE,
             KEY_ALL_ACCESS, NULL, &Registrykey, NULL) == ERROR_SUCCESS) {
         logger.write("Created new registry entry (HKCU) for Steam");
@@ -205,6 +316,8 @@ static bool patch_registry_hkcu()
 static void cleanup_registry_hkcu()
 {
     if (!orig_steam_hkcu) return;
+    // custom: still needed by the game of the other loader, which restores it later
+    if (other_loader_running()) return;
 
     logger.write("restoring registry entries (HKCU)");
     HKEY Registrykey = { 0 };
@@ -250,6 +363,20 @@ static bool patch_registry_hkcu_2()
             orig_steam_running_appid = true;
         }
         logger.write("Found previous registry entry (HKCU #2) for Steam");
+        // custom: left behind by another loader, restore Steam's own values (Steam writes them with '/')
+        auto steam_dir = get_real_steam_dir();
+        if (steam_dir.size()) {
+            const auto steam_dir_bs = steam_dir;
+            std::replace(steam_dir.begin(), steam_dir.end(), L'\\', L'/');
+            bool from_loader = replace_loader_value(OrgSteamPath_hkcu_2, Size2_hkcu_2, steam_dir);
+            from_loader = replace_loader_value(OrgSteamExe_2, Size3_hkcu_2, steam_dir + L"/steam.exe") || from_loader;
+            if (orig_steam_mod_dir) {
+                replace_loader_value(OrgSteamModDir_hkcu_2, Size1_hkcu_2, steam_dir_bs + L"\\steamapps\\sourcemods");
+            }
+            if (from_loader) {
+                OrgRunningAppID_hkcu_2 = 0;
+            }
+        }
     } else if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", 0, 0, REG_OPTION_NON_VOLATILE,
             KEY_ALL_ACCESS, NULL, &Registrykey, NULL) == ERROR_SUCCESS) {
         logger.write("Created new registry entry (HKCU #2) for Steam");
@@ -275,6 +402,8 @@ static bool patch_registry_hkcu_2()
 static void cleanup_registry_hkcu_2()
 {
     if (!orig_steam_hkcu_2) return;
+    // custom: see cleanup_registry_hkcu()
+    if (other_loader_running()) return;
 
     logger.write("restoring registry entries (HKCU #2)");
     HKEY Registrykey = { 0 };
@@ -316,6 +445,8 @@ static bool patch_registry_hklm()
         RegQueryValueExW(Registrykey, L"InstallPath", 0, &keyType, (LPBYTE)OrgInstallPath_hklm, &Size1_hklm);
         RegQueryValueExW(Registrykey, L"Universe", 0, &keyType, (LPBYTE)OrgUniverse_hklm, &Size2_hklm);
         logger.write("Found previous registry entry (HKLM) for Steam");
+        // custom: left behind by another loader
+        replace_loader_value(OrgInstallPath_hklm, Size1_hklm, get_real_steam_dir());
     } else if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, hklm_path.c_str(), 0, 0, REG_OPTION_NON_VOLATILE,
             KEY_ALL_ACCESS, NULL, &Registrykey, NULL) == ERROR_SUCCESS) {
         logger.write("Created new registry entry (HKLM) for Steam");
@@ -336,6 +467,8 @@ static bool patch_registry_hklm()
 static void cleanup_registry_hklm()
 {
     if (!orig_steam_hklm) return;
+    // custom: see cleanup_registry_hkcu()
+    if (other_loader_running()) return;
 
     logger.write("restoring registry entries (HKLM)");
     HKEY Registrykey = { 0 };
@@ -380,6 +513,11 @@ static bool patch_registry_hkcs()
         DWORD keyType = REG_SZ;
         RegQueryValueExW(Registrykey_2, L"", 0, &keyType, (LPBYTE)&OrgCommand_hkcs, &Size1_hkcs);
         logger.write("Found previous registry entry (HKCS) #2 for Steam");
+        // custom: left behind by another loader
+        const auto &steam_dir = get_real_steam_dir();
+        if (steam_dir.size()) {
+            replace_loader_value(OrgCommand_hkcs, Size1_hkcs, L"\"" + steam_dir + L"\\steam.exe\" -- \"%1\"");
+        }
     } else if (RegCreateKeyExW(HKEY_CLASSES_ROOT, L"steam\\Shell\\Open\\Command", 0, 0, REG_OPTION_NON_VOLATILE,
             KEY_ALL_ACCESS, NULL, &Registrykey_2, NULL) == ERROR_SUCCESS) {
         logger.write("Created new registry entry (HKCS) #2 for Steam");
@@ -401,6 +539,9 @@ static bool patch_registry_hkcs()
 
 static void cleanup_registry_hkcs()
 {
+    // custom: see cleanup_registry_hkcu()
+    if (other_loader_running()) return;
+
     if (orig_steam_hkcs_2) {
         logger.write("restoring registry entries (HKCS) #2");
         HKEY Registrykey = { 0 };
@@ -531,8 +672,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         }
         cmdline_arg = common_helpers::to_str(cmd_arg);
 
-        std::vector<std::string> candidates{ cmdline_arg };
-        if (!std::filesystem::u8path(cmdline_arg).is_absolute()) {
+        std::vector<std::string> candidates{};
+        if (cmdline_arg.rfind("-- \"steam://", 0) != 0) { // steam:// handler, see below
+            candidates.push_back(cmdline_arg);
+        }
+        if (candidates.size() && !std::filesystem::u8path(cmdline_arg).is_absolute()) {
             candidates.push_back(common_helpers::to_absolute(cmdline_arg, pe_helpers::get_current_exe_path()));
         }
         for (const auto &candidate : candidates) {
@@ -552,6 +696,46 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                 break;
             }
         }
+    }
+
+    // custom: a steam:// link opened through the handler a loader registered (see
+    // patch_registry_hkcs). a shared loader has no ini of its own to start, so:
+    // while a loader game runs, keep the request away from Steam (LAN only);
+    // otherwise the handler was left behind, restore Steam's registry values
+    // (patch + cleanup restores the replaced originals) and pass the link on to Steam
+    if (!common_helpers::file_exist(IniFile) && cmdline_arg.rfind("-- \"steam://", 0) == 0) {
+        if (other_loader_running()) {
+            logger.write("Ignoring steam:// link while another loader is running: " + cmdline_arg);
+            return 0;
+        }
+        const auto &steam_dir = get_real_steam_dir();
+        if (steam_dir.empty()) {
+            logger.write("Couldn't find Steam to pass a steam:// link on to");
+            MessageBoxA(NULL, "Couldn't find the Steam folder to pass the steam:// link on to.", "ColdClientLoader", MB_ICONERROR);
+            return 1;
+        }
+        patch_registry_hkcu();
+        patch_registry_hkcu_2();
+        patch_registry_hklm();
+        patch_registry_hkcs();
+        cleanup_registry_hkcu();
+        cleanup_registry_hkcu_2();
+        cleanup_registry_hklm();
+        cleanup_registry_hkcs();
+
+        const auto steam_exe = steam_dir + L"\\steam.exe";
+        auto steam_cmdline = L"\"" + steam_exe + L"\" " + std::wstring(lpCmdLine);
+        STARTUPINFOW si = { 0 };
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi = { 0 };
+        if (!CreateProcessW(steam_exe.c_str(), &steam_cmdline[0], NULL, NULL, FALSE, 0, NULL, steam_dir.c_str(), &si, &pi)) {
+            logger.write("Unable to start Steam, error = " + std::to_string(GetLastError()));
+            MessageBoxA(NULL, "Unable to start Steam.", "ColdClientLoader", MB_ICONERROR);
+            return 1;
+        }
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return 0;
     }
 
     if (!common_helpers::file_exist(IniFile)) {
