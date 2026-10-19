@@ -664,7 +664,30 @@ HINTERNET WINAPI Mine_WinHttpOpenRequest(
 }
 
 
+// custom: load the replacement for dlls listed in [main::dll_redirect] (see settings_dll_redirects()),
+// no matter whether the game loads them by name or by full path (UE loads EOSSDK by full path)
+HMODULE (WINAPI *Real_LoadLibraryExW)(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) = nullptr;
+
+static HMODULE WINAPI Mine_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
+{
+    constexpr DWORD data_flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+    if (lpLibFileName && !(dwFlags & data_flags)) {
+        std::wstring_view path(lpLibFileName);
+        auto sep = path.find_last_of(L"\\/");
+        auto name = common_helpers::to_lower(sep == std::wstring_view::npos ? path : path.substr(sep + 1));
+        const auto &redirects = settings_dll_redirects();
+        auto it = redirects.find(name);
+        if (it != redirects.end()) {
+            PRINT_DEBUG("redirecting '%ls' to '%ls'", lpLibFileName, it->second.c_str());
+            return Real_LoadLibraryExW(it->second.c_str(), hFile, dwFlags);
+        }
+    }
+
+    return Real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+}
+
 static bool network_functions_attached = false;
+static bool loadlibrary_attached = false;
 BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
 {
     switch ( dwReason ) {
@@ -689,6 +712,18 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                 DetourTransactionCommit();
                 network_functions_attached = true;
             }
+            // custom: see Mine_LoadLibraryExW()
+            if (!settings_dll_redirects().empty()) {
+                HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+                Real_LoadLibraryExW = (decltype(Real_LoadLibraryExW))GetProcAddress(kernelbase ? kernelbase : GetModuleHandleW(L"kernel32.dll"), "LoadLibraryExW");
+                if (Real_LoadLibraryExW) {
+                    PRINT_DEBUG("Hooking LoadLibraryExW for dll redirects");
+                    DetourTransactionBegin();
+                    DetourUpdateThread( GetCurrentThread() );
+                    DetourAttach( reinterpret_cast<PVOID*>(&Real_LoadLibraryExW), reinterpret_cast<PVOID>(Mine_LoadLibraryExW) );
+                    loadlibrary_attached = DetourTransactionCommit() == NO_ERROR;
+                }
+            }
             load_crack_dll();
             load_dlls();
         break;
@@ -705,6 +740,12 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                     DetourDetach( reinterpret_cast<PVOID*>(&Real_WinHttpConnect), reinterpret_cast<PVOID>(Mine_WinHttpConnect) );
                     // DetourDetach( reinterpret_cast<PVOID*>(&Real_WinHttpOpenRequest), reinterpret_cast<PVOID>(Mine_WinHttpOpenRequest) );
                 }
+                DetourTransactionCommit();
+            }
+            if (loadlibrary_attached) {
+                DetourTransactionBegin();
+                DetourUpdateThread( GetCurrentThread() );
+                DetourDetach( reinterpret_cast<PVOID*>(&Real_LoadLibraryExW), reinterpret_cast<PVOID>(Mine_LoadLibraryExW) );
                 DetourTransactionCommit();
             }
 
