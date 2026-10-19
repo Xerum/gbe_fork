@@ -26,6 +26,9 @@ void save_global_settings(class Local_Storage *local_storage, const char *name, 
 
 bool settings_disable_lan_only();
 
+// custom: [main::dll_redirect], lowercase dll file name -> absolute path of its replacement
+const std::map<std::wstring, std::wstring>& settings_dll_redirects();
+
 enum class SettingsItf {
    CLIENT,
    GAMESERVER_STATS,
