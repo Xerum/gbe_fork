@@ -592,6 +592,25 @@ static void set_steam_env_vars()
     // steamclient64.dll itself is loaded from a central, shared location
     // (see dll/base.cpp get_full_program_path(), checks GseAppPath first)
     SetEnvironmentVariableW(L"GseAppPath", common_helpers::to_wstr(IniDir).c_str());
+
+    // custom: extra env vars for the game from the [Environment] section, e.g. the settings folder
+    // of a dll redirected per game: EPICEMU_SETTINGS_DIR=%GseAppPath%inject
+    // %VAR% references are expanded, GseAppPath (= IniDir, ends with '\') is already set at this point
+    std::list<CSimpleIniA::Entry> env_names{};
+    if (local_ini.GetAllKeys("Environment", env_names)) {
+        for (const auto &env_name : env_names) {
+            auto value = common_helpers::to_wstr(local_ini.GetValue("Environment", env_name.pItem, ""));
+            std::wstring expanded(32767, L'\0');
+            DWORD len = ExpandEnvironmentStringsW(value.c_str(), &expanded[0], (DWORD)expanded.size());
+            if (len && len <= expanded.size()) {
+                expanded.resize(len - 1);
+            } else {
+                expanded = value;
+            }
+            logger.write(std::string("setting env var '") + env_name.pItem + "'");
+            SetEnvironmentVariableW(common_helpers::to_wstr(env_name.pItem).c_str(), expanded.c_str());
+        }
+    }
 }
 
 
