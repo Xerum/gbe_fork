@@ -748,6 +748,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         return 1;
     }
 
+    // custom: a relative ini path (e.g. "1282100" resolved against the working dir)
+    // must become absolute here, otherwise GseAppPath/SteamPath stay relative and
+    // the game, which runs in its own folder, never finds the per-game steam_settings
+    IniFile = std::filesystem::absolute(std::filesystem::u8path(IniFile)).u8string();
     IniDir = std::filesystem::u8path(IniFile).parent_path().u8string();
     if (IniDir.empty() || IniDir.back() != '\\') {
         IniDir.append("\\");
