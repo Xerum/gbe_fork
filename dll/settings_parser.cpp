@@ -2269,6 +2269,34 @@ bool settings_disable_lan_only()
     return ini.GetBoolValue("main::connectivity", "disable_lan_only", false);
 }
 
+// custom: dlls the game should load from another place, e.g. an EOS emulator kept outside the game folder
+// [main::dll_redirect]
+// EOSSDK-Win64-Shipping.dll=..\inject\EOSSDK-Win64-Shipping.dll
+// relative paths are resolved against the game's steam_settings folder
+const std::map<std::wstring, std::wstring>& settings_dll_redirects()
+{
+    static std::map<std::wstring, std::wstring> redirects{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return redirects;
+    parsed = true;
+
+    std::list<CSimpleIniA::Entry> names{};
+    if (!ini.GetAllKeys("main::dll_redirect", names) || names.empty()) return redirects;
+
+    for (const auto &name : names) {
+        auto val_ptr = ini.GetValue("main::dll_redirect", name.pItem);
+        if (!val_ptr || !val_ptr[0]) continue;
+
+        auto path = common_helpers::to_absolute(val_ptr, Local_Storage::get_game_settings_path());
+        PRINT_DEBUG("dll redirect '%s' -> '%s'", name.pItem, path.c_str());
+        redirects[common_helpers::to_lower(common_helpers::to_wstr(name.pItem))] = common_helpers::to_wstr(path);
+    }
+
+    return redirects;
+}
+
 const std::map<SettingsItf, std::string>& settings_old_interfaces()
 {
     load_all_config_settings();
