@@ -779,7 +779,8 @@ static DWORD WINAPI hook_playfab_get_full_url(LPVOID)
         DetourTransactionBegin();
         DetourUpdateThread( GetCurrentThread() );
         DetourAttach( reinterpret_cast<PVOID*>(&Real_PlayFabGetFullUrl), reinterpret_cast<PVOID>(Mine_PlayFabGetFullUrl) );
-        PRINT_DEBUG("hooking PlayFab.PlayFabSettings.GetFullUrl, result %li", DetourTransactionCommit());
+        [[maybe_unused]] LONG res = DetourTransactionCommit();
+        PRINT_DEBUG("hooking PlayFab.PlayFabSettings.GetFullUrl, result %li", res);
         return 0;
     }
 
@@ -804,7 +805,8 @@ static void hook_il2cpp_init(HMODULE game_assembly)
     DetourTransactionBegin();
     DetourUpdateThread( GetCurrentThread() );
     DetourAttach( reinterpret_cast<PVOID*>(&Real_il2cpp_init), reinterpret_cast<PVOID>(Mine_il2cpp_init) );
-    PRINT_DEBUG("hooking il2cpp_init for playfab, result %li", DetourTransactionCommit());
+    [[maybe_unused]] LONG res = DetourTransactionCommit();
+    PRINT_DEBUG("hooking il2cpp_init for playfab, result %li", res);
 }
 
 // custom: load the replacement for dlls listed in [main::dll_redirect] (see settings_dll_redirects()),
