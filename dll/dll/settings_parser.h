@@ -29,6 +29,12 @@ bool settings_disable_lan_only();
 // custom: [main::dll_redirect], lowercase dll file name -> absolute path of its replacement
 const std::map<std::wstring, std::wstring>& settings_dll_redirects();
 
+// custom: [main::host_redirect], lowercase host name -> address it should resolve to
+const std::map<std::string, std::string>& settings_host_redirects();
+
+// custom: [main::playfab] url, replaces https://<titleid>.playfabapi.com in Unity games (empty = off)
+const std::wstring& settings_playfab_url();
+
 enum class SettingsItf {
    CLIENT,
    GAMESERVER_STATS,
