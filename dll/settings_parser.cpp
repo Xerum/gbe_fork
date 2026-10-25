@@ -2297,6 +2297,54 @@ const std::map<std::wstring, std::wstring>& settings_dll_redirects()
     return redirects;
 }
 
+// custom: host names the game should resolve to another address, e.g. a self-hosted Photon server
+// [main::host_redirect]
+// ns.exitgames.com=192.168.178.43
+const std::map<std::string, std::string>& settings_host_redirects()
+{
+    static std::map<std::string, std::string> redirects{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return redirects;
+    parsed = true;
+
+    std::list<CSimpleIniA::Entry> names{};
+    if (!ini.GetAllKeys("main::host_redirect", names) || names.empty()) return redirects;
+
+    for (const auto &name : names) {
+        auto val_ptr = ini.GetValue("main::host_redirect", name.pItem);
+        if (!val_ptr || !val_ptr[0]) continue;
+
+        PRINT_DEBUG("host redirect '%s' -> '%s'", name.pItem, val_ptr);
+        redirects[common_helpers::to_lower(name.pItem)] = val_ptr;
+    }
+
+    return redirects;
+}
+
+// custom: server replacing PlayFab in Unity games using the PlayFab SDK
+// [main::playfab]
+// url=http://192.168.178.43:47600
+const std::wstring& settings_playfab_url()
+{
+    static std::wstring url{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return url;
+    parsed = true;
+
+    std::string val = ini.GetValue("main::playfab", "url", "");
+    while (!val.empty() && (val.back() == '/' || val.back() == ' ')) val.pop_back();
+    if (val.size()) {
+        PRINT_DEBUG("playfab url '%s'", val.c_str());
+        url = common_helpers::to_wstr(val);
+    }
+
+    return url;
+}
+
 const std::map<SettingsItf, std::string>& settings_old_interfaces()
 {
     load_all_config_settings();
