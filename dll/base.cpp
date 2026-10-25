@@ -664,6 +664,149 @@ HINTERNET WINAPI Mine_WinHttpOpenRequest(
 }
 
 
+// custom: resolve host names listed in [main::host_redirect] (see settings_host_redirects()) to the configured address,
+// like an entry in the hosts file, but only for this game
+// the wide strings are kept for the whole lifetime of the process because GetAddrInfoExW() may resolve asynchronously
+static std::map<std::string, std::wstring> host_redirects_w{};
+
+static const std::string* host_redirect(PCSTR host)
+{
+    const auto &redirects = settings_host_redirects();
+    auto it = redirects.find(common_helpers::to_lower(host));
+    return it == redirects.end() ? nullptr : &it->second;
+}
+
+static const std::wstring* host_redirect_w(PCWSTR host)
+{
+    auto it = host_redirects_w.find(common_helpers::to_lower(common_helpers::to_str(host)));
+    return it == host_redirects_w.end() ? nullptr : &it->second;
+}
+
+static decltype(&getaddrinfo) Real_getaddrinfo = getaddrinfo;
+static decltype(&GetAddrInfoW) Real_GetAddrInfoW = GetAddrInfoW;
+static decltype(&GetAddrInfoExW) Real_GetAddrInfoExW = GetAddrInfoExW;
+
+static INT WSAAPI Mine_getaddrinfo(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA *pHints, PADDRINFOA *ppResult)
+{
+    const std::string *addr = pNodeName ? host_redirect(pNodeName) : nullptr;
+    if (addr) {
+        PRINT_DEBUG("redirecting host '%s' to '%s'", pNodeName, addr->c_str());
+        return Real_getaddrinfo(addr->c_str(), pServiceName, pHints, ppResult);
+    }
+
+    return Real_getaddrinfo(pNodeName, pServiceName, pHints, ppResult);
+}
+
+static INT WSAAPI Mine_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW *pHints, PADDRINFOW *ppResult)
+{
+    const std::wstring *addr = pNodeName ? host_redirect_w(pNodeName) : nullptr;
+    if (addr) {
+        PRINT_DEBUG("redirecting host '%ls' to '%ls'", pNodeName, addr->c_str());
+        return Real_GetAddrInfoW(addr->c_str(), pServiceName, pHints, ppResult);
+    }
+
+    return Real_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+}
+
+static INT WSAAPI Mine_GetAddrInfoExW(PCWSTR pName, PCWSTR pServiceName, DWORD dwNameSpace, LPGUID lpNspId, const ADDRINFOEXW *hints,
+    PADDRINFOEXW *ppResult, struct timeval *timeout, LPOVERLAPPED lpOverlapped, LPLOOKUPSERVICE_COMPLETION_ROUTINE lpCompletionRoutine, LPHANDLE lpHandle)
+{
+    const std::wstring *addr = pName ? host_redirect_w(pName) : nullptr;
+    if (addr) {
+        PRINT_DEBUG("redirecting host '%ls' to '%ls'", pName, addr->c_str());
+        pName = addr->c_str();
+    }
+
+    return Real_GetAddrInfoExW(pName, pServiceName, dwNameSpace, lpNspId, hints, ppResult, timeout, lpOverlapped, lpCompletionRoutine, lpHandle);
+}
+
+// custom: point the PlayFab SDK of Unity (il2cpp) games at the server from [main::playfab] (see settings_playfab_url())
+// by rewriting the result of PlayFab.PlayFabSettings.GetFullUrl(), which builds the url of every PlayFab api call:
+// https://<titleid>.playfabapi.com/Client/LoginWithSteam?sdk=... -> <url>/Client/LoginWithSteam?sdk=...
+// the method can only be found once il2cpp_init() has loaded the metadata, so GameAssembly.dll's il2cpp_init() gets hooked first
+static void* (*il2cpp_string_new_utf16_fn)(const wchar_t *text, int32_t len) = nullptr;
+static void* (*Real_PlayFabGetFullUrl)(void *apiCall, void *getParams, void *apiSettings, const void *method) = nullptr;
+static int (*Real_il2cpp_init)(const char *domain_name) = nullptr;
+
+static void* Mine_PlayFabGetFullUrl(void *apiCall, void *getParams, void *apiSettings, const void *method)
+{
+    void *ret = Real_PlayFabGetFullUrl(apiCall, getParams, apiSettings, method);
+    if (!ret) return ret;
+
+    // System.String: object header (klass, monitor), int32 length, utf-16 chars
+    auto str = reinterpret_cast<const char *>(ret) + 2 * sizeof(void *);
+    std::wstring_view url(reinterpret_cast<const wchar_t *>(str + sizeof(int32_t)), *reinterpret_cast<const int32_t *>(str));
+    auto host_start = url.find(L"://");
+    if (host_start == std::wstring_view::npos) return ret;
+    host_start += 3;
+    auto path_start = url.find(L'/', host_start);
+    auto host = url.substr(host_start, path_start == std::wstring_view::npos ? std::wstring_view::npos : path_start - host_start);
+    if (common_helpers::to_lower(host).find(L"playfabapi.com") == std::wstring::npos) return ret;
+
+    std::wstring new_url = settings_playfab_url();
+    if (path_start != std::wstring_view::npos) new_url.append(url.substr(path_start));
+    PRINT_DEBUG("playfab '%ls' -> '%ls'", std::wstring(url).c_str(), new_url.c_str());
+    return il2cpp_string_new_utf16_fn(new_url.c_str(), static_cast<int32_t>(new_url.size()));
+}
+
+static DWORD WINAPI hook_playfab_get_full_url(LPVOID)
+{
+    HMODULE game_assembly = GetModuleHandleW(L"GameAssembly.dll");
+    if (!game_assembly) return 0;
+
+    auto domain_get = (void* (*)())GetProcAddress(game_assembly, "il2cpp_domain_get");
+    auto domain_get_assemblies = (void** (*)(const void *, size_t *))GetProcAddress(game_assembly, "il2cpp_domain_get_assemblies");
+    auto assembly_get_image = (void* (*)(const void *))GetProcAddress(game_assembly, "il2cpp_assembly_get_image");
+    auto class_from_name = (void* (*)(const void *, const char *, const char *))GetProcAddress(game_assembly, "il2cpp_class_from_name");
+    auto class_get_method_from_name = (const void* (*)(void *, const char *, int))GetProcAddress(game_assembly, "il2cpp_class_get_method_from_name");
+    il2cpp_string_new_utf16_fn = (decltype(il2cpp_string_new_utf16_fn))GetProcAddress(game_assembly, "il2cpp_string_new_utf16");
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name || !class_get_method_from_name || !il2cpp_string_new_utf16_fn) {
+        PRINT_DEBUG("missing il2cpp exports");
+        return 0;
+    }
+
+    size_t count = 0;
+    void **assemblies = domain_get_assemblies(domain_get(), &count);
+    for (size_t i = 0; assemblies && i < count; ++i) {
+        void *klass = class_from_name(assembly_get_image(assemblies[i]), "PlayFab", "PlayFabSettings");
+        if (!klass) continue;
+
+        // MethodInfo starts with the pointer to the native code of the method
+        const void *method = class_get_method_from_name(klass, "GetFullUrl", 3);
+        if (!method || !*reinterpret_cast<void * const *>(method)) break;
+
+        Real_PlayFabGetFullUrl = *reinterpret_cast<decltype(Real_PlayFabGetFullUrl) const *>(method);
+        DetourTransactionBegin();
+        DetourUpdateThread( GetCurrentThread() );
+        DetourAttach( reinterpret_cast<PVOID*>(&Real_PlayFabGetFullUrl), reinterpret_cast<PVOID>(Mine_PlayFabGetFullUrl) );
+        PRINT_DEBUG("hooking PlayFab.PlayFabSettings.GetFullUrl, result %li", DetourTransactionCommit());
+        return 0;
+    }
+
+    PRINT_DEBUG("PlayFab.PlayFabSettings.GetFullUrl not found");
+    return 0;
+}
+
+static int Mine_il2cpp_init(const char *domain_name)
+{
+    int ret = Real_il2cpp_init(domain_name);
+    hook_playfab_get_full_url(nullptr);
+    return ret;
+}
+
+static void hook_il2cpp_init(HMODULE game_assembly)
+{
+    if (Real_il2cpp_init) return;
+
+    Real_il2cpp_init = (decltype(Real_il2cpp_init))GetProcAddress(game_assembly, "il2cpp_init");
+    if (!Real_il2cpp_init) return;
+
+    DetourTransactionBegin();
+    DetourUpdateThread( GetCurrentThread() );
+    DetourAttach( reinterpret_cast<PVOID*>(&Real_il2cpp_init), reinterpret_cast<PVOID>(Mine_il2cpp_init) );
+    PRINT_DEBUG("hooking il2cpp_init for playfab, result %li", DetourTransactionCommit());
+}
+
 // custom: load the replacement for dlls listed in [main::dll_redirect] (see settings_dll_redirects()),
 // no matter whether the game loads them by name or by full path (UE loads EOSSDK by full path)
 HMODULE (WINAPI *Real_LoadLibraryExW)(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) = nullptr;
@@ -681,6 +824,13 @@ static HMODULE WINAPI Mine_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
             PRINT_DEBUG("redirecting '%ls' to '%ls'", lpLibFileName, it->second.c_str());
             return Real_LoadLibraryExW(it->second.c_str(), hFile, dwFlags);
         }
+
+        // custom: see Mine_PlayFabGetFullUrl()
+        if (name == L"gameassembly.dll" && settings_playfab_url().size()) {
+            HMODULE module = Real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+            if (module) hook_il2cpp_init(module);
+            return module;
+        }
     }
 
     return Real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
@@ -688,6 +838,7 @@ static HMODULE WINAPI Mine_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
 
 static bool network_functions_attached = false;
 static bool loadlibrary_attached = false;
+static bool host_functions_attached = false;
 BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
 {
     switch ( dwReason ) {
@@ -713,7 +864,7 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                 network_functions_attached = true;
             }
             // custom: see Mine_LoadLibraryExW()
-            if (!settings_dll_redirects().empty()) {
+            if (!settings_dll_redirects().empty() || settings_playfab_url().size()) {
                 HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
                 Real_LoadLibraryExW = (decltype(Real_LoadLibraryExW))GetProcAddress(kernelbase ? kernelbase : GetModuleHandleW(L"kernel32.dll"), "LoadLibraryExW");
                 if (Real_LoadLibraryExW) {
@@ -723,6 +874,25 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                     DetourAttach( reinterpret_cast<PVOID*>(&Real_LoadLibraryExW), reinterpret_cast<PVOID>(Mine_LoadLibraryExW) );
                     loadlibrary_attached = DetourTransactionCommit() == NO_ERROR;
                 }
+            }
+            // custom: see Mine_PlayFabGetFullUrl(), without ForceInjectSteamClient the game has already initialized il2cpp
+            // when it loads this dll, the hook is placed from a new thread because il2cpp must not be called under the loader lock
+            if (settings_playfab_url().size() && GetModuleHandleW(L"GameAssembly.dll")) {
+                HANDLE thread = CreateThread(nullptr, 0, hook_playfab_get_full_url, nullptr, 0, nullptr);
+                if (thread) CloseHandle(thread);
+            }
+            // custom: see Mine_getaddrinfo()
+            if (!settings_host_redirects().empty()) {
+                for (const auto &[host, addr] : settings_host_redirects()) {
+                    host_redirects_w[host] = common_helpers::to_wstr(addr);
+                }
+                PRINT_DEBUG("Hooking getaddrinfo for host redirects");
+                DetourTransactionBegin();
+                DetourUpdateThread( GetCurrentThread() );
+                DetourAttach( reinterpret_cast<PVOID*>(&Real_getaddrinfo), reinterpret_cast<PVOID>(Mine_getaddrinfo) );
+                DetourAttach( reinterpret_cast<PVOID*>(&Real_GetAddrInfoW), reinterpret_cast<PVOID>(Mine_GetAddrInfoW) );
+                DetourAttach( reinterpret_cast<PVOID*>(&Real_GetAddrInfoExW), reinterpret_cast<PVOID>(Mine_GetAddrInfoExW) );
+                host_functions_attached = DetourTransactionCommit() == NO_ERROR;
             }
             load_crack_dll();
             load_dlls();
@@ -748,6 +918,15 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                 DetourDetach( reinterpret_cast<PVOID*>(&Real_LoadLibraryExW), reinterpret_cast<PVOID>(Mine_LoadLibraryExW) );
                 DetourTransactionCommit();
             }
+            if (host_functions_attached) {
+                DetourTransactionBegin();
+                DetourUpdateThread( GetCurrentThread() );
+                DetourDetach( reinterpret_cast<PVOID*>(&Real_getaddrinfo), reinterpret_cast<PVOID>(Mine_getaddrinfo) );
+                DetourDetach( reinterpret_cast<PVOID*>(&Real_GetAddrInfoW), reinterpret_cast<PVOID>(Mine_GetAddrInfoW) );
+                DetourDetach( reinterpret_cast<PVOID*>(&Real_GetAddrInfoExW), reinterpret_cast<PVOID>(Mine_GetAddrInfoExW) );
+                DetourTransactionCommit();
+            }
+            // the il2cpp hooks stay, GameAssembly.dll is only unloaded together with the process
 
             unload_dlls();
         break;
