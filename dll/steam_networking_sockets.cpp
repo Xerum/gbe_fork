@@ -17,6 +17,22 @@
 
 #include "dll/steam_networking_sockets.h"
 
+// custom: see header
+FnSteamNetConnectionStatusChanged gbe_global_conn_status_cb = nullptr;
+struct shared_between_client_server *gbe_sns_config_sbcs = nullptr;
+
+static FnSteamNetConnectionStatusChanged gbe_status_cb_from_options(int nOptions, const SteamNetworkingConfigValue_t *pOptions)
+{
+    if (!pOptions) return nullptr;
+    for (int i = 0; i < nOptions; ++i) {
+        if (pOptions[i].m_eValue == k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged && pOptions[i].m_eDataType == k_ESteamNetworkingConfig_Ptr) {
+            PRINT_DEBUG("connection status function callback from options %p", pOptions[i].m_val.m_ptr);
+            return (FnSteamNetConnectionStatusChanged)pOptions[i].m_val.m_ptr;
+        }
+    }
+    return nullptr;
+}
+
 
 void Steam_Networking_Sockets::steam_callback(void *object, Common_Message *msg)
 {
@@ -94,6 +110,11 @@ HSteamNetConnection Steam_Networking_Sockets::new_connect_socket(SteamNetworking
     socket.connect_request_last_sent = std::chrono::steady_clock::now();
     socket.connect_requests_sent = 0;
     socket.packet_send_counter = 1;
+    socket.status_cb = pending_connect_cb;
+    if (!socket.status_cb && listen_socket_id != k_HSteamListenSocket_Invalid) {
+        struct Listen_Socket *ls = get_connection_socket(listen_socket_id);
+        if (ls) socket.status_cb = ls->status_cb;
+    }
 
     HSteamNetConnection socket_id = get_socket_id();
     if (socket_id == k_HSteamNetConnection_Invalid) ++socket_id;
@@ -240,6 +261,14 @@ void Steam_Networking_Sockets::launch_callback(HSteamNetConnection m_hConn, enum
     data.m_hConn = connect_socket->first;
     data.m_eOldState = convert_status(old_status);
     set_steamnetconnectioninfo(connect_socket, &data.m_info);
+
+    // custom: games using GameNetworkingSockets-style code register a function callback instead of a Steam callback
+    FnSteamNetConnectionStatusChanged fn = connect_socket->second.status_cb ? connect_socket->second.status_cb : gbe_global_conn_status_cb;
+    if (fn) {
+        PRINT_DEBUG("queue function callback for connection %u state %i -> %i", data.m_hConn, (int)data.m_eOldState, (int)data.m_info.m_eState);
+        pending_status_cbs.emplace_back(fn, data);
+        return;
+    }
     callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
 }
 
@@ -257,6 +286,7 @@ Steam_Networking_Sockets::Steam_Networking_Sockets(class Settings *settings, cla
     if (!sbcs) { // client
         this->sbcs = new shared_between_client_server();
         this->sbcs->used = 0;
+        gbe_sns_config_sbcs = this->sbcs; // custom
     } else { // game server
         this->sbcs = sbcs;
         ++this->sbcs->used;
@@ -346,7 +376,10 @@ HSteamListenSocket Steam_Networking_Sockets::CreateListenSocketIP( const SteamNe
 {
     PRINT_DEBUG_ENTRY();
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
-    return new_listen_socket(SNS_DISABLED_PORT, localAddress.m_port);
+    HSteamListenSocket id = new_listen_socket(SNS_DISABLED_PORT, localAddress.m_port);
+    struct Listen_Socket *ls = get_connection_socket(id);
+    if (ls) ls->status_cb = gbe_status_cb_from_options(nOptions, pOptions); // custom
+    return id;
 }
 
 /// Creates a connection and begins talking to a "server" over UDP at the
@@ -401,8 +434,12 @@ HSteamNetConnection Steam_Networking_Sockets::ConnectByIPAddress( const SteamNet
         PRINT_DEBUG("refusing connect to port 0");
         return k_HSteamNetConnection_Invalid;
     }
-    // TODO config options
-    return ConnectByIPAddress(address);
+    // custom: config options -> connection status function callback
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    pending_connect_cb = gbe_status_cb_from_options(nOptions, pOptions);
+    HSteamNetConnection conn = ConnectByIPAddress(address);
+    pending_connect_cb = nullptr;
+    return conn;
 }
 
 /// Like CreateListenSocketIP, but clients will connect using ConnectP2P
@@ -425,9 +462,11 @@ HSteamListenSocket Steam_Networking_Sockets::CreateListenSocketP2P( int nVirtual
 HSteamListenSocket Steam_Networking_Sockets::CreateListenSocketP2P( int nVirtualPort, int nOptions, const SteamNetworkingConfigValue_t *pOptions )
 {
     PRINT_DEBUG("%i", nVirtualPort);
-    //TODO config options
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
-    return new_listen_socket(nVirtualPort, SNS_DISABLED_PORT);
+    HSteamListenSocket id = new_listen_socket(nVirtualPort, SNS_DISABLED_PORT);
+    struct Listen_Socket *ls = get_connection_socket(id);
+    if (ls) ls->status_cb = gbe_status_cb_from_options(nOptions, pOptions); // custom
+    return id;
 }
 
 /// Begin connecting to a server that is identified using a platform-specific identifier.
@@ -479,8 +518,12 @@ HSteamNetConnection Steam_Networking_Sockets::ConnectP2P( const SteamNetworkingI
 HSteamNetConnection Steam_Networking_Sockets::ConnectP2P( const SteamNetworkingIdentity &identityRemote, int nVirtualPort, int nOptions, const SteamNetworkingConfigValue_t *pOptions )
 {
     PRINT_DEBUG("%i", nVirtualPort);
-    //TODO config options
-    return ConnectP2P(identityRemote, nVirtualPort);
+    // custom: config options -> connection status function callback
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    pending_connect_cb = gbe_status_cb_from_options(nOptions, pOptions);
+    HSteamNetConnection conn = ConnectP2P(identityRemote, nVirtualPort);
+    pending_connect_cb = nullptr;
+    return conn;
 }
 
 /// Creates a connection and begins talking to a remote destination.  The remote host
@@ -2222,6 +2265,16 @@ void Steam_Networking_Sockets::RunCallbacks()
         }
 
         ++socket_conn;
+    }
+
+    // custom: invoke queued connection status function callbacks
+    if (!pending_status_cbs.empty()) {
+        auto cbs = std::move(pending_status_cbs);
+        pending_status_cbs.clear();
+        for (auto &cb : cbs) {
+            PRINT_DEBUG("calling function callback for connection %u", cb.second.m_hConn);
+            cb.first(&cb.second);
+        }
     }
 }
 
