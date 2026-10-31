@@ -2248,6 +2248,22 @@ void Steam_Networking_Sockets::Callback(Common_Message *msg)
             std::vector<Listen_Socket>::iterator conn;
             if (virtual_port == SNS_DISABLED_PORT) {
                 conn = std::find_if(sbcs->listen_sockets.begin(), sbcs->listen_sockets.end(), [&real_port,&dest_id](struct Listen_Socket const& conn) { return conn.real_port == real_port && dest_id == conn.created_by.ConvertToUint64();});
+                // custom: the client often does not know the real port (GetListenSocketAddress is not implemented,
+                // games then advertise an empty address and connect to port 0) -> accept on our only IP listen socket
+                if (conn == sbcs->listen_sockets.end()) {
+                    auto ip_socket = sbcs->listen_sockets.end();
+                    int ip_sockets = 0;
+                    for (auto it = sbcs->listen_sockets.begin(); it != sbcs->listen_sockets.end(); ++it) {
+                        if (it->virtual_port == SNS_DISABLED_PORT && dest_id == it->created_by.ConvertToUint64()) {
+                            ip_socket = it;
+                            ++ip_sockets;
+                        }
+                    }
+                    if (ip_sockets == 1) {
+                        PRINT_DEBUG("no IP listen socket on port %i, using the only one on port %i", real_port, ip_socket->real_port);
+                        conn = ip_socket;
+                    }
+                }
             } else {
                 conn = std::find_if(sbcs->listen_sockets.begin(), sbcs->listen_sockets.end(), [&virtual_port,&dest_id](struct Listen_Socket const& conn) { return conn.virtual_port == virtual_port && dest_id == conn.created_by.ConvertToUint64();});
             }
