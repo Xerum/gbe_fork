@@ -27,6 +27,9 @@ struct Listen_Socket {
     int real_port{};
 
     CSteamID created_by{};
+
+    // custom: function callback set via k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged
+    FnSteamNetConnectionStatusChanged status_cb{};
 };
 
 enum connect_socket_status {
@@ -64,6 +67,9 @@ struct Connect_Socket {
 
     std::chrono::steady_clock::time_point connect_request_last_sent{};
     unsigned connect_requests_sent{};
+
+    // custom: function callback set via k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged
+    FnSteamNetConnectionStatusChanged status_cb{};
 };
 
 struct shared_between_client_server {
@@ -72,6 +78,11 @@ struct shared_between_client_server {
     std::map<HSteamNetPollGroup, std::list<HSteamNetConnection>> poll_groups{};
     unsigned used{};
 };
+
+// custom: global connection status function callback (SetGlobalCallback_SteamNetConnectionStatusChanged)
+// and the client instance's shared state, so ISteamNetworkingUtils::SetConfigValue can reach sockets/connections
+extern FnSteamNetConnectionStatusChanged gbe_global_conn_status_cb;
+extern struct shared_between_client_server *gbe_sns_config_sbcs;
 
 class Steam_Networking_Sockets :
 public ISteamNetworkingSockets001,
@@ -122,6 +133,10 @@ public ISteamNetworkingSockets
 
 
     void launch_callback(HSteamNetConnection m_hConn, enum connect_socket_status old_status);
+
+    // custom: function callbacks are queued and invoked from RunCallbacks() (like Steam does)
+    FnSteamNetConnectionStatusChanged pending_connect_cb{};
+    std::vector<std::pair<FnSteamNetConnectionStatusChanged, SteamNetConnectionStatusChangedCallback_t>> pending_status_cbs{};
 
     void Callback(Common_Message *msg);
 
