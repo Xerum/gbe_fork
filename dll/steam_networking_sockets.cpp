@@ -47,7 +47,11 @@ void Steam_Networking_Sockets::steam_run_every_runcb(void *object)
     // PRINT_DEBUG_ENTRY();
 
     Steam_Networking_Sockets *steam_networkingsockets = (Steam_Networking_Sockets *)object;
-    steam_networkingsockets->RunCallbacks();
+    // custom: the emu's own run loop must not count as the game's RunCallbacks() call
+    steam_networkingsockets->run_connection_retries();
+    if (!steam_networkingsockets->explicit_runcallbacks_seen) {
+        steam_networkingsockets->dispatch_status_cbs();
+    }
 }
 
 SteamNetworkingMessage_t* Steam_Networking_Sockets::get_steam_message_connection(HSteamNetConnection hConn)
@@ -2253,7 +2257,19 @@ void Steam_Networking_Sockets::RunCallbacks( ISteamNetworkingSocketsCallbacks *p
 void Steam_Networking_Sockets::RunCallbacks()
 {
     // PRINT_DEBUG_ENTRY();
+    // custom: called by the game -> dispatch function callbacks here (see header)
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    if (!explicit_runcallbacks_seen) {
+        PRINT_DEBUG("game calls RunCallbacks() itself, function callbacks are dispatched from here now");
+        explicit_runcallbacks_seen = true;
+    }
+    run_connection_retries();
+    dispatch_status_cbs();
+}
 
+void Steam_Networking_Sockets::run_connection_retries()
+{
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
     //TODO: timeout unaccepted connections after a few seconds or so
     auto current_time = std::chrono::steady_clock::now();
     auto socket_conn = std::begin(sbcs->connect_sockets);
@@ -2266,7 +2282,11 @@ void Steam_Networking_Sockets::RunCallbacks()
 
         ++socket_conn;
     }
+}
 
+void Steam_Networking_Sockets::dispatch_status_cbs()
+{
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
     // custom: invoke queued connection status function callbacks
     if (!pending_status_cbs.empty()) {
         auto cbs = std::move(pending_status_cbs);
