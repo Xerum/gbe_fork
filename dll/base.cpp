@@ -610,76 +610,202 @@ bool crack_SteamAPI_Init()
     return false;
 }
 
-HINTERNET (WINAPI *Real_WinHttpConnect)(
-  IN HINTERNET     hSession,
-  IN LPCWSTR       pswzServerName,
-  IN INTERNET_PORT nServerPort,
-  IN DWORD         dwReserved
-);
-
-HINTERNET WINAPI Mine_WinHttpConnect(
-  IN HINTERNET     hSession,
-  IN LPCWSTR       pswzServerName,
-  IN INTERNET_PORT nServerPort,
-  IN DWORD         dwReserved
-) {
-    PRINT_DEBUG("%ls %u", pswzServerName, nServerPort);
-    struct sockaddr_in ip4;
-    struct sockaddr_in6 ip6;
-    ip4.sin_family = AF_INET;
-    ip6.sin6_family = AF_INET6;
-
-    if ((InetPtonW(AF_INET, pswzServerName, &(ip4.sin_addr)) && is_lan_ip((sockaddr *)&ip4, sizeof(ip4))) || (InetPtonW(AF_INET6, pswzServerName, &(ip6.sin6_addr)) && is_lan_ip((sockaddr *)&ip6, sizeof(ip6)))) {
-        return Real_WinHttpConnect(hSession, pswzServerName, nServerPort, dwReserved);
-    } else {
-        return Real_WinHttpConnect(hSession, L"127.1.33.7", nServerPort, dwReserved);
-    }
-}
-
-HINTERNET (WINAPI *Real_WinHttpOpenRequest)(
-  IN HINTERNET hConnect,
-  IN LPCWSTR   pwszVerb,
-  IN LPCWSTR   pwszObjectName,
-  IN LPCWSTR   pwszVersion,
-  IN LPCWSTR   pwszReferrer,
-  IN LPCWSTR   *ppwszAcceptTypes,
-  IN DWORD     dwFlags
-);
-
-HINTERNET WINAPI Mine_WinHttpOpenRequest(
-  IN HINTERNET hConnect,
-  IN LPCWSTR   pwszVerb,
-  IN LPCWSTR   pwszObjectName,
-  IN LPCWSTR   pwszVersion,
-  IN LPCWSTR   pwszReferrer,
-  IN LPCWSTR   *ppwszAcceptTypes,
-  IN DWORD     dwFlags
-) {
-    PRINT_DEBUG("%ls %ls %ls %ls %i", pwszVerb, pwszObjectName, pwszVersion, pwszReferrer, dwFlags);
-    if (dwFlags & WINHTTP_FLAG_SECURE) {
-        dwFlags ^= WINHTTP_FLAG_SECURE;
-    }
-
-    return Real_WinHttpOpenRequest(hConnect, pwszVerb, pwszObjectName, pwszVersion, pwszReferrer, ppwszAcceptTypes, dwFlags);
-}
-
-
 // custom: resolve host names listed in [main::host_redirect] (see settings_host_redirects()) to the configured address,
 // like an entry in the hosts file, but only for this game
 // the wide strings are kept for the whole lifetime of the process because GetAddrInfoExW() may resolve asynchronously
 static std::map<std::string, std::wstring> host_redirects_w{};
 
-static const std::string* host_redirect(PCSTR host)
+static bool is_ip_literal(const std::string &host)
 {
-    const auto &redirects = settings_host_redirects();
-    auto it = redirects.find(common_helpers::to_lower(host));
+    in_addr ip4{};
+    in6_addr ip6{};
+    std::string h = host;
+    if (h.size() > 2 && h.front() == '[' && h.back() == ']') h = h.substr(1, h.size() - 2);
+    return inet_pton(AF_INET, h.c_str(), &ip4) == 1 || inet_pton(AF_INET6, h.c_str(), &ip6) == 1;
+}
+
+// exact name first, then the longest matching "*.domain" pattern, then "*"
+// "*" only applies to dotted names which are no ip literals, so the own computer name, "localhost" and addresses stay untouched
+template<typename T>
+static const T* match_host_redirect(const std::map<std::string, T> &redirects, std::string host)
+{
+    if (redirects.empty() || host.empty()) return nullptr;
+    host = common_helpers::to_lower(host);
+    while (!host.empty() && host.back() == '.') host.pop_back();
+
+    auto it = redirects.find(host);
+    if (it != redirects.end()) return &it->second;
+    if (is_ip_literal(host)) return nullptr;
+
+    const T *best = nullptr;
+    size_t best_len = 0;
+    for (const auto &[pattern, addr] : redirects) {
+        if (pattern.size() < 3 || pattern[0] != '*' || pattern[1] != '.') continue;
+        std::string domain = pattern.substr(2);  // "example.com"
+        std::string suffix = pattern.substr(1);  // ".example.com"
+        bool match = host == domain ||
+            (host.size() > suffix.size() && host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0);
+        if (match && pattern.size() > best_len) {
+            best = &addr;
+            best_len = pattern.size();
+        }
+    }
+    if (best) return best;
+
+    if (host.find('.') == std::string::npos) return nullptr;
+    it = redirects.find("*");
     return it == redirects.end() ? nullptr : &it->second;
 }
 
-static const std::wstring* host_redirect_w(PCWSTR host)
+// custom: [main::host_redirect_log], one line per redirected name, to find out which services a game talks to
+static void log_host_redirect(const char *func, const std::string &host, const std::string &addr)
 {
-    auto it = host_redirects_w.find(common_helpers::to_lower(common_helpers::to_str(host)));
-    return it == host_redirects_w.end() ? nullptr : &it->second;
+    const auto &path = settings_host_redirect_log();
+    if (path.empty()) return;
+
+    static std::mutex log_mutex{};
+    std::lock_guard lock(log_mutex);
+    FILE *f = _wfopen(common_helpers::to_wstr(path).c_str(), L"a");
+    if (!f) return;
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    fprintf(f, "%02u:%02u:%02u.%03u %s %s -> %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, func, host.c_str(), addr.c_str());
+    fclose(f);
+}
+
+static const std::string* host_redirect(PCSTR host)
+{
+    const std::string *addr = match_host_redirect(settings_host_redirects(), std::string(host));
+    if (addr) log_host_redirect("getaddrinfo", host, *addr);
+    return addr;
+}
+
+static const std::wstring* host_redirect_w(PCWSTR host, const char *func = "GetAddrInfoW")
+{
+    const std::wstring *addr = match_host_redirect(host_redirects_w, common_helpers::to_str(host));
+    if (addr) log_host_redirect(func, common_helpers::to_str(host), common_helpers::to_str(*addr));
+    return addr;
+}
+
+// custom: WinHTTP
+// - lan only mode: connections to names/addresses outside the lan go to 127.1.33.7 (original behaviour)
+// - [main::host_redirect]: WinHTTP connects to the configured address directly (it does not have to resolve the name through
+//   the hooked functions) and every request of that connection gets the original "Host" header, so a local replacement
+//   still knows which service was meant
+// - [main::winhttp] ignore_cert_errors=1: every request accepts any server certificate
+// winhttp.dll is often loaded after this dll (ForceInjectSteamClient), the hooks are then placed by Mine_LoadLibraryExW()
+HINTERNET (WINAPI *Real_WinHttpConnect)(HINTERNET hSession, LPCWSTR pswzServerName, INTERNET_PORT nServerPort, DWORD dwReserved) = nullptr;
+HINTERNET (WINAPI *Real_WinHttpOpenRequest)(HINTERNET hConnect, LPCWSTR pwszVerb, LPCWSTR pwszObjectName, LPCWSTR pwszVersion,
+    LPCWSTR pwszReferrer, LPCWSTR *ppwszAcceptTypes, DWORD dwFlags) = nullptr;
+static BOOL (WINAPI *WinHttpAddRequestHeaders_fn)(HINTERNET hRequest, LPCWSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwModifiers) = nullptr;
+static BOOL (WINAPI *WinHttpSetOption_fn)(HINTERNET hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength) = nullptr;
+
+static std::mutex winhttp_hosts_mutex{};
+static std::unordered_map<HINTERNET, std::wstring> winhttp_hosts{};  // connection handle -> value of the "Host" header
+static bool winhttp_attached = false;
+
+static bool winhttp_hooks_wanted()
+{
+    return !settings_disable_lan_only() || !settings_host_redirects().empty() || settings_winhttp_ignore_cert_errors();
+}
+
+// only the custom options wait for winhttp.dll to be loaded later, the lan only mode keeps its original behaviour
+static bool winhttp_late_hooks_wanted()
+{
+    return !settings_host_redirects().empty() || settings_winhttp_ignore_cert_errors();
+}
+
+HINTERNET WINAPI Mine_WinHttpConnect(HINTERNET hSession, LPCWSTR pswzServerName, INTERNET_PORT nServerPort, DWORD dwReserved)
+{
+    PRINT_DEBUG("%ls %u", pswzServerName, nServerPort);
+    HINTERNET ret = nullptr;
+    std::wstring host_header{};
+
+    const std::wstring *addr = pswzServerName ? host_redirect_w(pswzServerName, "WinHttpConnect") : nullptr;
+    if (addr) {
+        ret = Real_WinHttpConnect(hSession, addr->c_str(), nServerPort, dwReserved);
+        host_header = pswzServerName;
+        if (nServerPort != INTERNET_DEFAULT_PORT && nServerPort != 80 && nServerPort != 443) {
+            host_header += L":" + std::to_wstring(nServerPort);
+        }
+    } else if (settings_disable_lan_only() || !pswzServerName) {
+        ret = Real_WinHttpConnect(hSession, pswzServerName, nServerPort, dwReserved);
+    } else {
+        struct sockaddr_in ip4{};
+        struct sockaddr_in6 ip6{};
+        ip4.sin_family = AF_INET;
+        ip6.sin6_family = AF_INET6;
+        if ((InetPtonW(AF_INET, pswzServerName, &(ip4.sin_addr)) && is_lan_ip((sockaddr *)&ip4, sizeof(ip4))) || (InetPtonW(AF_INET6, pswzServerName, &(ip6.sin6_addr)) && is_lan_ip((sockaddr *)&ip6, sizeof(ip6)))) {
+            ret = Real_WinHttpConnect(hSession, pswzServerName, nServerPort, dwReserved);
+        } else {
+            ret = Real_WinHttpConnect(hSession, L"127.1.33.7", nServerPort, dwReserved);
+        }
+    }
+
+    if (ret) {
+        std::lock_guard lock(winhttp_hosts_mutex);
+        if (host_header.size()) winhttp_hosts[ret] = host_header;
+        else winhttp_hosts.erase(ret);  // handle values get reused
+    }
+    return ret;
+}
+
+HINTERNET WINAPI Mine_WinHttpOpenRequest(HINTERNET hConnect, LPCWSTR pwszVerb, LPCWSTR pwszObjectName, LPCWSTR pwszVersion,
+    LPCWSTR pwszReferrer, LPCWSTR *ppwszAcceptTypes, DWORD dwFlags)
+{
+    PRINT_DEBUG("%ls %ls %i", pwszVerb, pwszObjectName, dwFlags);
+    HINTERNET req = Real_WinHttpOpenRequest(hConnect, pwszVerb, pwszObjectName, pwszVersion, pwszReferrer, ppwszAcceptTypes, dwFlags);
+    if (!req) return req;
+
+    std::wstring host_header{};
+    {
+        std::lock_guard lock(winhttp_hosts_mutex);
+        auto it = winhttp_hosts.find(hConnect);
+        if (it != winhttp_hosts.end()) host_header = it->second;
+    }
+    if (host_header.size() && WinHttpAddRequestHeaders_fn) {
+        std::wstring header = L"Host: " + host_header;
+        WinHttpAddRequestHeaders_fn(req, header.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    }
+    if (settings_winhttp_ignore_cert_errors() && WinHttpSetOption_fn) {
+        DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+            SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption_fn(req, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+    }
+    return req;
+}
+
+// returns true if the hooks are in place, must not be called under the loader lock unless winhttp.dll is already loaded
+static bool attach_winhttp_hooks()
+{
+    if (winhttp_attached) return true;
+    HMODULE winhttp = GetModuleHandleW(L"winhttp.dll");
+    if (!winhttp) return false;
+
+    Real_WinHttpConnect = (decltype(Real_WinHttpConnect))GetProcAddress(winhttp, "WinHttpConnect");
+    Real_WinHttpOpenRequest = (decltype(Real_WinHttpOpenRequest))GetProcAddress(winhttp, "WinHttpOpenRequest");
+    WinHttpAddRequestHeaders_fn = (decltype(WinHttpAddRequestHeaders_fn))GetProcAddress(winhttp, "WinHttpAddRequestHeaders");
+    WinHttpSetOption_fn = (decltype(WinHttpSetOption_fn))GetProcAddress(winhttp, "WinHttpSetOption");
+    if (!Real_WinHttpConnect || !Real_WinHttpOpenRequest) return false;
+
+    DetourTransactionBegin();
+    DetourUpdateThread( GetCurrentThread() );
+    DetourAttach( reinterpret_cast<PVOID*>(&Real_WinHttpConnect), reinterpret_cast<PVOID>(Mine_WinHttpConnect) );
+    DetourAttach( reinterpret_cast<PVOID*>(&Real_WinHttpOpenRequest), reinterpret_cast<PVOID>(Mine_WinHttpOpenRequest) );
+    winhttp_attached = DetourTransactionCommit() == NO_ERROR;
+    PRINT_DEBUG("hooking winhttp, result %i", (int)winhttp_attached);
+    return winhttp_attached;
+}
+
+static void detach_winhttp_hooks()
+{
+    if (!winhttp_attached) return;
+    DetourTransactionBegin();
+    DetourUpdateThread( GetCurrentThread() );
+    DetourDetach( reinterpret_cast<PVOID*>(&Real_WinHttpConnect), reinterpret_cast<PVOID>(Mine_WinHttpConnect) );
+    DetourDetach( reinterpret_cast<PVOID*>(&Real_WinHttpOpenRequest), reinterpret_cast<PVOID>(Mine_WinHttpOpenRequest) );
+    DetourTransactionCommit();
+    winhttp_attached = false;
 }
 
 static decltype(&getaddrinfo) Real_getaddrinfo = getaddrinfo;
@@ -711,7 +837,7 @@ static INT WSAAPI Mine_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const
 static INT WSAAPI Mine_GetAddrInfoExW(PCWSTR pName, PCWSTR pServiceName, DWORD dwNameSpace, LPGUID lpNspId, const ADDRINFOEXW *hints,
     PADDRINFOEXW *ppResult, struct timeval *timeout, LPOVERLAPPED lpOverlapped, LPLOOKUPSERVICE_COMPLETION_ROUTINE lpCompletionRoutine, LPHANDLE lpHandle)
 {
-    const std::wstring *addr = pName ? host_redirect_w(pName) : nullptr;
+    const std::wstring *addr = pName ? host_redirect_w(pName, "GetAddrInfoExW") : nullptr;
     if (addr) {
         PRINT_DEBUG("redirecting host '%ls' to '%ls'", pName, addr->c_str());
         pName = addr->c_str();
@@ -835,7 +961,10 @@ static HMODULE WINAPI Mine_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
         }
     }
 
-    return Real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+    HMODULE module = Real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+    // custom: winhttp.dll may come in as a dependency of any dll, see attach_winhttp_hooks()
+    if (module && !winhttp_attached && winhttp_late_hooks_wanted()) attach_winhttp_hooks();
+    return module;
 }
 
 static bool network_functions_attached = false;
@@ -853,20 +982,15 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                 DetourAttach( reinterpret_cast<PVOID*>(&Real_SendTo), reinterpret_cast<PVOID>(Mine_SendTo) );
                 DetourAttach( reinterpret_cast<PVOID*>(&Real_Connect), reinterpret_cast<PVOID>(Mine_Connect) );
                 DetourAttach( reinterpret_cast<PVOID*>(&Real_WSAConnect), reinterpret_cast<PVOID>(Mine_WSAConnect) );
-
-                HMODULE winhttp = GetModuleHandleA("winhttp.dll");
-                if (winhttp) {
-                    Real_WinHttpConnect = (decltype(Real_WinHttpConnect))GetProcAddress(winhttp, "WinHttpConnect");
-                    DetourAttach( reinterpret_cast<PVOID*>(&Real_WinHttpConnect), reinterpret_cast<PVOID>(Mine_WinHttpConnect) );
-                    // Real_WinHttpOpenRequest = (decltype(Real_WinHttpOpenRequest))GetProcAddress(winhttp, "WinHttpOpenRequest");
-                    // DetourAttach( reinterpret_cast<PVOID*>(&Real_WinHttpOpenRequest), reinterpret_cast<PVOID>(Mine_WinHttpOpenRequest) );
-                }
-    
                 DetourTransactionCommit();
                 network_functions_attached = true;
             }
+            // custom: see Mine_WinHttpConnect(), only if winhttp.dll is already there, otherwise Mine_LoadLibraryExW() does it
+            if (winhttp_hooks_wanted()) {
+                attach_winhttp_hooks();
+            }
             // custom: see Mine_LoadLibraryExW()
-            if (!settings_dll_redirects().empty() || settings_playfab_url().size()) {
+            if (!settings_dll_redirects().empty() || settings_playfab_url().size() || winhttp_late_hooks_wanted()) {
                 HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
                 Real_LoadLibraryExW = (decltype(Real_LoadLibraryExW))GetProcAddress(kernelbase ? kernelbase : GetModuleHandleW(L"kernel32.dll"), "LoadLibraryExW");
                 if (Real_LoadLibraryExW) {
@@ -908,12 +1032,9 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                 DetourDetach( reinterpret_cast<PVOID*>(&Real_SendTo), reinterpret_cast<PVOID>(Mine_SendTo) );
                 DetourDetach( reinterpret_cast<PVOID*>(&Real_Connect), reinterpret_cast<PVOID>(Mine_Connect) );
                 DetourDetach( reinterpret_cast<PVOID*>(&Real_WSAConnect), reinterpret_cast<PVOID>(Mine_WSAConnect) );
-                if (Real_WinHttpConnect) {
-                    DetourDetach( reinterpret_cast<PVOID*>(&Real_WinHttpConnect), reinterpret_cast<PVOID>(Mine_WinHttpConnect) );
-                    // DetourDetach( reinterpret_cast<PVOID*>(&Real_WinHttpOpenRequest), reinterpret_cast<PVOID>(Mine_WinHttpOpenRequest) );
-                }
                 DetourTransactionCommit();
             }
+            detach_winhttp_hooks();
             if (loadlibrary_attached) {
                 DetourTransactionBegin();
                 DetourUpdateThread( GetCurrentThread() );
