@@ -1163,8 +1163,24 @@ bool Networking::sendToIPPort(Common_Message *msg, uint32 ip, uint16 port, bool 
     uint32_t local_ip = getIP(ids.front());
     PRINT_DEBUG("%X %u %X", ip, is_local_ip, local_ip);
     //TODO: actually send to ip/port
+    bool found = false;
     for (auto &conn: connections) {
         if (ntohl(conn.tcp_ip_port.ip) == ip || (is_local_ip && ntohl(conn.tcp_ip_port.ip) == local_ip)) {
+            found = true;
+            for (auto &steam_id : conn.ids) {
+                msg->set_dest_id(steam_id.ConvertToUint64());
+                sendTo(msg, reliable, &conn);
+            }
+        }
+    }
+
+    // custom: a peer is often known under a different address than the one the game uses
+    // (same PC, or LAN + ZeroTier/VPN adapters) -> no exact match means the message was silently dropped.
+    // Fall back to all peers of this app; only the one with a matching listen socket accepts it.
+    if (!found) {
+        PRINT_DEBUG("no peer with ip %X, sending to all peers of app %u", ip, appid);
+        for (auto &conn: connections) {
+            if (conn.appid != appid) continue;
             for (auto &steam_id : conn.ids) {
                 msg->set_dest_id(steam_id.ConvertToUint64());
                 sendTo(msg, reliable, &conn);
