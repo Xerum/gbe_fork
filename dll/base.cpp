@@ -923,15 +923,12 @@ static bool (*Real_PhotonOpAuthenticate)(void *self, void *appId, void *appVersi
 static bool (*Real_PhotonOpAuthenticateOnce)(void *self, void *appId, void *appVersion, void *authValues, void *regionCode, uintptr_t encryptionMode, uintptr_t expectedProtocol, const void *method) = nullptr;
 static void* (*il2cpp_object_get_class_fn)(void *obj) = nullptr;
 static const void* (*il2cpp_class_get_method_from_name_fn)(void *klass, const char *name, int argsCount) = nullptr;
-static void *photon_app_id_str = nullptr;
-
 static void photon_patch_auth(void *&appId, void *authValues)
 {
-    if (!photon_app_id_str) {
-        const auto &app_id = settings_photon_app_id();
-        photon_app_id_str = il2cpp_string_new_utf16_fn(app_id.c_str(), static_cast<int32_t>(app_id.size()));
-    }
-    if (photon_app_id_str) appId = photon_app_id_str;
+    // a new string on every call: a cached one isn't referenced by managed code and gets collected by the il2cpp gc
+    const auto &app_id = settings_photon_app_id();
+    void *str = il2cpp_string_new_utf16_fn(app_id.c_str(), static_cast<int32_t>(app_id.size()));
+    if (str) appId = str;
 
     if (authValues && !settings_photon_keep_auth()) {
         // AuthenticationValues.AuthType = CustomAuthenticationType.None (byte 255)
