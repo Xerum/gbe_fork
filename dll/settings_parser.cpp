@@ -2378,6 +2378,36 @@ const std::wstring& settings_playfab_url()
     return url;
 }
 
+// custom: own Photon cloud app for Unity (il2cpp) games using Photon Realtime/Fusion with custom authentication
+// [main::photon]
+// app_id=<guid of an own Photon app of the same product, e.g. Fusion 2>
+// keep_auth=1 keeps the authentication of the game (default: authentication type None, no token check by Photon)
+const std::wstring& settings_photon_app_id()
+{
+    static std::wstring app_id{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return app_id;
+    parsed = true;
+
+    std::string val = ini.GetValue("main::photon", "app_id", "");
+    while (!val.empty() && val.back() == ' ') val.pop_back();
+    while (!val.empty() && val.front() == ' ') val.erase(val.begin());
+    if (val.size()) {
+        PRINT_DEBUG("photon app id '%s'", val.c_str());
+        app_id = common_helpers::to_wstr(val);
+    }
+
+    return app_id;
+}
+
+bool settings_photon_keep_auth()
+{
+    load_all_config_settings();
+    return ini.GetBoolValue("main::photon", "keep_auth", false);
+}
+
 const std::map<SettingsItf, std::string>& settings_old_interfaces()
 {
     load_all_config_settings();
