@@ -30,7 +30,14 @@ bool settings_disable_lan_only();
 const std::map<std::wstring, std::wstring>& settings_dll_redirects();
 
 // custom: [main::host_redirect], lowercase host name -> address it should resolve to
+// keys may also be "*.example.com" (the domain and all sub domains) or "*" (every other dotted host name, no ip literals)
 const std::map<std::string, std::string>& settings_host_redirects();
+
+// custom: [main::host_redirect_log] path, file that gets one line per redirected host name (empty = off)
+const std::string& settings_host_redirect_log();
+
+// custom: [main::winhttp] ignore_cert_errors, WinHTTP requests of the game accept any server certificate
+bool settings_winhttp_ignore_cert_errors();
 
 // custom: [main::playfab] url, replaces https://<titleid>.playfabapi.com in Unity games (empty = off)
 const std::wstring& settings_playfab_url();
