@@ -1030,14 +1030,12 @@ static constexpr std::array<il2cpp_generic_fn, sizeof...(N)> make_skip_if_destro
     return { &Mine_skip_if_destroyed<N>... };
 }
 
-static void hook_il2cpp_skip_if_destroyed()
+// finds the MethodInfo of "Namespace.Class.Method" (any parameter count, or the parameterless one if other_method is set:
+// then "Namespace.Class.<other_method>"), nullptr if il2cpp isn't ready or the method doesn't exist
+static const void* find_il2cpp_method(const std::string &full, const char *other_method = nullptr)
 {
-    static bool done = false;
-    const auto &methods = settings_il2cpp_skip_if_destroyed();
-    if (done || methods.empty()) return;
-
     HMODULE game_assembly = GetModuleHandleW(L"GameAssembly.dll");
-    if (!game_assembly) return;
+    if (!game_assembly) return nullptr;
     auto domain_get = (void* (*)())GetProcAddress(game_assembly, "il2cpp_domain_get");
     auto domain_get_assemblies = (void** (*)(const void *, size_t *))GetProcAddress(game_assembly, "il2cpp_domain_get_assemblies");
     auto assembly_get_image = (void* (*)(const void *))GetProcAddress(game_assembly, "il2cpp_assembly_get_image");
@@ -1045,44 +1043,109 @@ static void hook_il2cpp_skip_if_destroyed()
     auto class_get_method_from_name = (const void* (*)(void *, const char *, int))GetProcAddress(game_assembly, "il2cpp_class_get_method_from_name");
     if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name || !class_get_method_from_name) {
         PRINT_DEBUG("missing il2cpp exports");
-        return;
+        return nullptr;
     }
+
+    auto method_sep = full.rfind('.');
+    if (method_sep == std::string::npos) return nullptr;
+    std::string class_full = full.substr(0, method_sep), method_name = other_method ? std::string(other_method) : full.substr(method_sep + 1);
+    auto class_sep = class_full.rfind('.');
+    std::string ns = class_sep == std::string::npos ? std::string() : class_full.substr(0, class_sep);
+    std::string class_name = class_sep == std::string::npos ? class_full : class_full.substr(class_sep + 1);
+
+    size_t count = 0;
+    void **assemblies = domain_get_assemblies(domain_get(), &count);
+    for (size_t i = 0; assemblies && i < count; ++i) {
+        void *klass = class_from_name(assembly_get_image(assemblies[i]), ns.c_str(), class_name.c_str());
+        if (!klass) continue;
+        const void *method = class_get_method_from_name(klass, method_name.c_str(), other_method ? 0 : -1);
+        if (!method || !*reinterpret_cast<void * const *>(method)) return nullptr;
+        return method;
+    }
+    return nullptr;
+}
+
+static void hook_il2cpp_skip_if_destroyed()
+{
+    static bool done = false;
+    const auto &methods = settings_il2cpp_skip_if_destroyed();
+    if (done || methods.empty() || !GetModuleHandleW(L"GameAssembly.dll")) return;
     done = true;
 
     static const auto hooks = make_skip_if_destroyed_hooks(std::make_integer_sequence<int, skip_if_destroyed_slots>{});
     int slot = 0;
-    size_t count = 0;
-    void **assemblies = domain_get_assemblies(domain_get(), &count);
     for (const auto &full : methods) {
         if (slot >= skip_if_destroyed_slots) break;
-        auto method_sep = full.rfind('.');
-        if (method_sep == std::string::npos) continue;
-        std::string class_full = full.substr(0, method_sep), method_name = full.substr(method_sep + 1);
-        auto class_sep = class_full.rfind('.');
-        std::string ns = class_sep == std::string::npos ? std::string() : class_full.substr(0, class_sep);
-        std::string class_name = class_sep == std::string::npos ? class_full : class_full.substr(class_sep + 1);
-
-        for (size_t i = 0; assemblies && i < count; ++i) {
-            void *klass = class_from_name(assembly_get_image(assemblies[i]), ns.c_str(), class_name.c_str());
-            if (!klass) continue;
-            const void *method = class_get_method_from_name(klass, method_name.c_str(), -1);
-            if (!method || !*reinterpret_cast<void * const *>(method)) break;
-
-            Real_skip_if_destroyed[slot] = *reinterpret_cast<il2cpp_generic_fn const *>(method);
-            DetourTransactionBegin();
-            DetourUpdateThread( GetCurrentThread() );
-            DetourAttach( reinterpret_cast<PVOID*>(&Real_skip_if_destroyed[slot]), reinterpret_cast<PVOID>(hooks[slot]) );
-            [[maybe_unused]] LONG res = DetourTransactionCommit();
-            PRINT_DEBUG("hooking '%s' (skip if destroyed, slot %i), result %li", full.c_str(), slot, res);
-            ++slot;
-            break;
+        const void *method = find_il2cpp_method(full);
+        if (!method) {
+            PRINT_DEBUG("'%s' not found", full.c_str());
+            continue;
         }
+        Real_skip_if_destroyed[slot] = *reinterpret_cast<il2cpp_generic_fn const *>(method);
+        DetourTransactionBegin();
+        DetourUpdateThread( GetCurrentThread() );
+        DetourAttach( reinterpret_cast<PVOID*>(&Real_skip_if_destroyed[slot]), reinterpret_cast<PVOID>(hooks[slot]) );
+        [[maybe_unused]] LONG res = DetourTransactionCommit();
+        PRINT_DEBUG("hooking '%s' (skip if destroyed, slot %i), result %li", full.c_str(), slot, res);
+        ++slot;
+    }
+}
+
+// custom: [main::il2cpp_redirect] (see settings_il2cpp_redirects()), the hooked instance method calls the parameterless
+// instance method of the same class instead, e.g. SplashscreenController.Start -> OnSplashScreenCompleted skips the intro
+constexpr int redirect_slots = 8;
+static il2cpp_generic_fn Real_redirect[redirect_slots] = {};
+typedef void (*il2cpp_noarg_fn)(void *self, const void *method);
+static il2cpp_noarg_fn Target_redirect_fn[redirect_slots] = {};
+static const void *Target_redirect_method[redirect_slots] = {};
+
+template<int N>
+static uintptr_t Mine_redirect(void *self, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t)
+{
+    PRINT_DEBUG("il2cpp redirect: slot %i", N);
+    Target_redirect_fn[N](self, Target_redirect_method[N]);
+    return 0;
+}
+
+template<int... N>
+static constexpr std::array<il2cpp_generic_fn, sizeof...(N)> make_redirect_hooks(std::integer_sequence<int, N...>)
+{
+    return { &Mine_redirect<N>... };
+}
+
+static void hook_il2cpp_redirects()
+{
+    static bool done = false;
+    const auto &redirects = settings_il2cpp_redirects();
+    if (done || redirects.empty() || !GetModuleHandleW(L"GameAssembly.dll")) return;
+    done = true;
+
+    static const auto hooks = make_redirect_hooks(std::make_integer_sequence<int, redirect_slots>{});
+    int slot = 0;
+    for (const auto &[from, to] : redirects) {
+        if (slot >= redirect_slots) break;
+        const void *method = find_il2cpp_method(from);
+        const void *target = find_il2cpp_method(from, to.c_str());
+        if (!method || !target) {
+            PRINT_DEBUG("'%s' -> '%s' not found", from.c_str(), to.c_str());
+            continue;
+        }
+        Target_redirect_method[slot] = target;
+        Target_redirect_fn[slot] = *reinterpret_cast<il2cpp_noarg_fn const *>(target);
+        Real_redirect[slot] = *reinterpret_cast<il2cpp_generic_fn const *>(method);
+        DetourTransactionBegin();
+        DetourUpdateThread( GetCurrentThread() );
+        DetourAttach( reinterpret_cast<PVOID*>(&Real_redirect[slot]), reinterpret_cast<PVOID>(hooks[slot]) );
+        [[maybe_unused]] LONG res = DetourTransactionCommit();
+        PRINT_DEBUG("hooking '%s' -> '%s' (redirect, slot %i), result %li", from.c_str(), to.c_str(), slot, res);
+        ++slot;
     }
 }
 
 static bool il2cpp_hooks_wanted()
 {
-    return settings_playfab_url().size() || settings_photon_app_id().size() || !settings_il2cpp_skip_if_destroyed().empty();
+    return settings_playfab_url().size() || settings_photon_app_id().size() || !settings_il2cpp_skip_if_destroyed().empty()
+        || !settings_il2cpp_redirects().empty();
 }
 
 static DWORD WINAPI hook_il2cpp_methods(LPVOID)
@@ -1090,6 +1153,7 @@ static DWORD WINAPI hook_il2cpp_methods(LPVOID)
     if (settings_playfab_url().size()) hook_playfab_get_full_url(nullptr);
     if (settings_photon_app_id().size()) hook_photon_authenticate(nullptr);
     hook_il2cpp_skip_if_destroyed();
+    hook_il2cpp_redirects();
     return 0;
 }
 
