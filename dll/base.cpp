@@ -933,8 +933,42 @@ static void photon_patch_auth(void *&appId, void *authValues)
     if (str) appId = str;
 
     if (authValues && !settings_photon_keep_auth()) {
+        void *klass = il2cpp_object_get_class_fn(authValues);
+        // with custom authentication the Photon server sets the UserId from the auth provider (PlayFab: the PlayFabId),
+        // with None it would be a random guid and games matching players by it (We Were Here Together: invited
+        // PlayFabId == Photon UserId) never see the other player join, so take it from the parameters
+        // ("username=<PlayFabId>&token=..." for PlayFab) if the game didn't set one
+        const void *get_user_id = il2cpp_class_get_method_from_name_fn(klass, "get_UserId", 0);
+        const void *set_user_id = il2cpp_class_get_method_from_name_fn(klass, "set_UserId", 1);
+        const void *get_params = il2cpp_class_get_method_from_name_fn(klass, "get_AuthGetParameters", 0);
+        if (get_user_id && set_user_id && get_params && *reinterpret_cast<void * const *>(get_user_id)
+            && *reinterpret_cast<void * const *>(set_user_id) && *reinterpret_cast<void * const *>(get_params)) {
+            auto get_str = [](const void *m, void *obj) -> std::wstring {
+                auto fn = *reinterpret_cast<void* (* const *)(void *, const void *)>(m);
+                void *s = fn(obj, m);
+                if (!s) return std::wstring();
+                auto p = reinterpret_cast<const char *>(s) + 2 * sizeof(void *);
+                return std::wstring(reinterpret_cast<const wchar_t *>(p + sizeof(int32_t)), *reinterpret_cast<const int32_t *>(p));
+            };
+            if (get_str(get_user_id, authValues).empty()) {
+                std::wstring params = get_str(get_params, authValues);
+                for (const wchar_t *key : { L"username=", L"userid=", L"UserId=" }) {
+                    size_t pos = params.find(key);
+                    if (pos == std::wstring::npos || (pos > 0 && params[pos - 1] != L'&' && params[pos - 1] != L'?')) continue;
+                    pos += wcslen(key);
+                    std::wstring id = params.substr(pos, params.find(L'&', pos) == std::wstring::npos ? std::wstring::npos : params.find(L'&', pos) - pos);
+                    if (id.empty()) continue;
+                    void *str = il2cpp_string_new_utf16_fn(id.c_str(), static_cast<int32_t>(id.size()));
+                    auto fn = *reinterpret_cast<void (* const *)(void *, void *, const void *)>(set_user_id);
+                    if (str) fn(authValues, str, set_user_id);
+                    PRINT_DEBUG("photon UserId set to '%ls'", id.c_str());
+                    break;
+                }
+            }
+        }
+
         // AuthenticationValues.AuthType = CustomAuthenticationType.None (byte 255)
-        const void *setter = il2cpp_class_get_method_from_name_fn(il2cpp_object_get_class_fn(authValues), "set_AuthType", 1);
+        const void *setter = il2cpp_class_get_method_from_name_fn(klass, "set_AuthType", 1);
         if (setter && *reinterpret_cast<void * const *>(setter)) {
             auto fn = *reinterpret_cast<void (* const *)(void *, uint8_t, const void *)>(setter);
             fn(authValues, 255, setter);
