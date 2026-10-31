@@ -2408,6 +2408,31 @@ bool settings_photon_keep_auth()
     return ini.GetBoolValue("main::photon", "keep_auth", false);
 }
 
+// custom: il2cpp instance methods that call another parameterless instance method of the same class instead
+// [main::il2cpp_redirect]
+// TMG.WWH.SplashScreen.SplashscreenController.Start=OnSplashScreenCompleted   (skips the intro videos)
+const std::vector<std::pair<std::string, std::string>>& settings_il2cpp_redirects()
+{
+    static std::vector<std::pair<std::string, std::string>> redirects{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return redirects;
+    parsed = true;
+
+    std::list<CSimpleIniA::Entry> names{};
+    if (!ini.GetAllKeys("main::il2cpp_redirect", names) || names.empty()) return redirects;
+
+    for (const auto &name : names) {
+        auto val_ptr = ini.GetValue("main::il2cpp_redirect", name.pItem);
+        if (!val_ptr || !val_ptr[0]) continue;
+        PRINT_DEBUG("il2cpp redirect '%s' -> '%s'", name.pItem, val_ptr);
+        redirects.emplace_back(name.pItem, val_ptr);
+    }
+
+    return redirects;
+}
+
 // custom: instance methods of UnityEngine.Object subclasses in il2cpp games that are skipped when called on an already
 // destroyed object (m_CachedPtr == null), e.g. callbacks that arrive after a scene change and would throw
 // [main::il2cpp_skip_if_destroyed]
