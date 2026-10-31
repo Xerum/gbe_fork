@@ -21,6 +21,20 @@
 FnSteamNetConnectionStatusChanged gbe_global_conn_status_cb = nullptr;
 struct shared_between_client_server *gbe_sns_config_sbcs = nullptr;
 
+// custom: k_ESteamNetworkingConfig_ConnectionUserData from the options, -1 if not set
+static int64 gbe_user_data_from_options(int nOptions, const SteamNetworkingConfigValue_t *pOptions)
+{
+    if (!pOptions) return -1;
+    for (int i = 0; i < nOptions; ++i) {
+        if (pOptions[i].m_eValue == k_ESteamNetworkingConfig_ConnectionUserData) {
+            int64 v = pOptions[i].m_eDataType == k_ESteamNetworkingConfig_Int32 ? (int64)pOptions[i].m_val.m_int32 : pOptions[i].m_val.m_int64;
+            PRINT_DEBUG("connection user data from options %lld", (long long)v);
+            return v;
+        }
+    }
+    return -1;
+}
+
 static FnSteamNetConnectionStatusChanged gbe_status_cb_from_options(int nOptions, const SteamNetworkingConfigValue_t *pOptions)
 {
     if (!pOptions) return nullptr;
@@ -115,9 +129,13 @@ HSteamNetConnection Steam_Networking_Sockets::new_connect_socket(SteamNetworking
     socket.connect_requests_sent = 0;
     socket.packet_send_counter = 1;
     socket.status_cb = pending_connect_cb;
-    if (!socket.status_cb && listen_socket_id != k_HSteamListenSocket_Invalid) {
+    if (pending_connect_user_data != -1) socket.user_data = pending_connect_user_data;
+    if (listen_socket_id != k_HSteamListenSocket_Invalid) {
         struct Listen_Socket *ls = get_connection_socket(listen_socket_id);
-        if (ls) socket.status_cb = ls->status_cb;
+        if (ls) {
+            if (!socket.status_cb) socket.status_cb = ls->status_cb;
+            if (ls->conn_user_data != -1) socket.user_data = ls->conn_user_data;
+        }
     }
 
     HSteamNetConnection socket_id = get_socket_id();
@@ -382,7 +400,10 @@ HSteamListenSocket Steam_Networking_Sockets::CreateListenSocketIP( const SteamNe
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
     HSteamListenSocket id = new_listen_socket(SNS_DISABLED_PORT, localAddress.m_port);
     struct Listen_Socket *ls = get_connection_socket(id);
-    if (ls) ls->status_cb = gbe_status_cb_from_options(nOptions, pOptions); // custom
+    if (ls) { // custom
+        ls->status_cb = gbe_status_cb_from_options(nOptions, pOptions);
+        ls->conn_user_data = gbe_user_data_from_options(nOptions, pOptions);
+    }
     return id;
 }
 
@@ -441,8 +462,10 @@ HSteamNetConnection Steam_Networking_Sockets::ConnectByIPAddress( const SteamNet
     // custom: config options -> connection status function callback
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
     pending_connect_cb = gbe_status_cb_from_options(nOptions, pOptions);
+    pending_connect_user_data = gbe_user_data_from_options(nOptions, pOptions);
     HSteamNetConnection conn = ConnectByIPAddress(address);
     pending_connect_cb = nullptr;
+    pending_connect_user_data = -1;
     return conn;
 }
 
@@ -469,7 +492,10 @@ HSteamListenSocket Steam_Networking_Sockets::CreateListenSocketP2P( int nVirtual
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
     HSteamListenSocket id = new_listen_socket(nVirtualPort, SNS_DISABLED_PORT);
     struct Listen_Socket *ls = get_connection_socket(id);
-    if (ls) ls->status_cb = gbe_status_cb_from_options(nOptions, pOptions); // custom
+    if (ls) { // custom
+        ls->status_cb = gbe_status_cb_from_options(nOptions, pOptions);
+        ls->conn_user_data = gbe_user_data_from_options(nOptions, pOptions);
+    }
     return id;
 }
 
@@ -525,8 +551,10 @@ HSteamNetConnection Steam_Networking_Sockets::ConnectP2P( const SteamNetworkingI
     // custom: config options -> connection status function callback
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
     pending_connect_cb = gbe_status_cb_from_options(nOptions, pOptions);
+    pending_connect_user_data = gbe_user_data_from_options(nOptions, pOptions);
     HSteamNetConnection conn = ConnectP2P(identityRemote, nVirtualPort);
     pending_connect_cb = nullptr;
+    pending_connect_user_data = -1;
     return conn;
 }
 
