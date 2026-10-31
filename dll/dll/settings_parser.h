@@ -42,6 +42,10 @@ bool settings_winhttp_ignore_cert_errors();
 // custom: [main::playfab] url, replaces https://<titleid>.playfabapi.com in Unity games (empty = off)
 const std::wstring& settings_playfab_url();
 
+// custom: [main::photon] app_id, own Photon app for Unity games (empty = off), keep_auth keeps the game's authentication
+const std::wstring& settings_photon_app_id();
+bool settings_photon_keep_auth();
+
 enum class SettingsItf {
    CLIENT,
    GAMESERVER_STATS,
