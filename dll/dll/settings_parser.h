@@ -49,6 +49,9 @@ bool settings_photon_keep_auth();
 // custom: [main::il2cpp_skip_if_destroyed] Namespace.Class.Method=1, skipped when called on a destroyed UnityEngine.Object
 const std::vector<std::string>& settings_il2cpp_skip_if_destroyed();
 
+// custom: [main::il2cpp_redirect] Namespace.Class.Method=OtherMethod, calls the parameterless OtherMethod of the same class instead
+const std::vector<std::pair<std::string, std::string>>& settings_il2cpp_redirects();
+
 enum class SettingsItf {
    CLIENT,
    GAMESERVER_STATS,
