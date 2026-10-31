@@ -380,6 +380,20 @@ bool Steam_Networking_Utils::SetConfigValue( ESteamNetworkingConfigValue eValue,
             if (it != gbe_sns_config_sbcs->connect_sockets.end()) it->second.status_cb = fn;
         }
     }
+    // custom: default user data for connections accepted on a listen socket / user data of a connection
+    if (eValue == k_ESteamNetworkingConfig_ConnectionUserData && gbe_sns_config_sbcs && pArg &&
+        (eDataType == k_ESteamNetworkingConfig_Int64 || eDataType == k_ESteamNetworkingConfig_Int32)) {
+        int64 v = eDataType == k_ESteamNetworkingConfig_Int64 ? *(const int64 *)pArg : (int64)*(const int32 *)pArg;
+        PRINT_DEBUG("connection user data %lld scope %i obj %" PRIdPTR, (long long)v, eScopeType, scopeObj);
+        if (eScopeType == k_ESteamNetworkingConfig_ListenSocket) {
+            for (auto &ls : gbe_sns_config_sbcs->listen_sockets) {
+                if (ls.socket_id == (HSteamListenSocket)scopeObj) ls.conn_user_data = v;
+            }
+        } else if (eScopeType == k_ESteamNetworkingConfig_Connection) {
+            auto it = gbe_sns_config_sbcs->connect_sockets.find((HSteamNetConnection)scopeObj);
+            if (it != gbe_sns_config_sbcs->connect_sockets.end()) it->second.user_data = v;
+        }
+    }
     return true;
 }
 
