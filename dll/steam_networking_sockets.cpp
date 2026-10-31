@@ -393,7 +393,14 @@ HSteamNetConnection Steam_Networking_Sockets::ConnectByIPAddress( const SteamNet
 
 HSteamNetConnection Steam_Networking_Sockets::ConnectByIPAddress( const SteamNetworkingIPAddr &address, int nOptions, const SteamNetworkingConfigValue_t *pOptions )
 {
-    PRINT_DEBUG("%X", address.GetIPv4());
+    PRINT_DEBUG("%X:%u", address.GetIPv4(), address.m_port);
+    // custom: port 0 can never be connected to (real Steam fails right away). Games that advertise several
+    // addresses (e.g. "ip:<empty>+steamid:..." because GetListenSocketAddress is not implemented) then try
+    // the next one instead of waiting forever on a connection nobody accepts.
+    if (address.m_port == 0) {
+        PRINT_DEBUG("refusing connect to port 0");
+        return k_HSteamNetConnection_Invalid;
+    }
     // TODO config options
     return ConnectByIPAddress(address);
 }
