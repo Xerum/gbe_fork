@@ -2408,6 +2408,31 @@ bool settings_photon_keep_auth()
     return ini.GetBoolValue("main::photon", "keep_auth", false);
 }
 
+// custom: instance methods of UnityEngine.Object subclasses in il2cpp games that are skipped when called on an already
+// destroyed object (m_CachedPtr == null), e.g. callbacks that arrive after a scene change and would throw
+// [main::il2cpp_skip_if_destroyed]
+// TMG.WWH.Engagement.EngagementScreenController.OnStepCompleted=1
+const std::vector<std::string>& settings_il2cpp_skip_if_destroyed()
+{
+    static std::vector<std::string> methods{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return methods;
+    parsed = true;
+
+    std::list<CSimpleIniA::Entry> names{};
+    if (!ini.GetAllKeys("main::il2cpp_skip_if_destroyed", names) || names.empty()) return methods;
+
+    for (const auto &name : names) {
+        if (!ini.GetBoolValue("main::il2cpp_skip_if_destroyed", name.pItem, false)) continue;
+        PRINT_DEBUG("il2cpp skip if destroyed '%s'", name.pItem);
+        methods.push_back(name.pItem);
+    }
+
+    return methods;
+}
+
 const std::map<SettingsItf, std::string>& settings_old_interfaces()
 {
     load_all_config_settings();
