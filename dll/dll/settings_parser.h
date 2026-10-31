@@ -46,6 +46,9 @@ const std::wstring& settings_playfab_url();
 const std::wstring& settings_photon_app_id();
 bool settings_photon_keep_auth();
 
+// custom: [main::il2cpp_skip_if_destroyed] Namespace.Class.Method=1, skipped when called on a destroyed UnityEngine.Object
+const std::vector<std::string>& settings_il2cpp_skip_if_destroyed();
+
 enum class SettingsItf {
    CLIENT,
    GAMESERVER_STATS,
