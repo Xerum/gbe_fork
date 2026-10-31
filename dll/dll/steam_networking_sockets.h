@@ -30,6 +30,8 @@ struct Listen_Socket {
 
     // custom: function callback set via k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged
     FnSteamNetConnectionStatusChanged status_cb{};
+    // custom: k_ESteamNetworkingConfig_ConnectionUserData -> default user data of accepted connections
+    int64 conn_user_data{-1};
 };
 
 enum connect_socket_status {
@@ -136,6 +138,7 @@ public ISteamNetworkingSockets
 
     // custom: function callbacks are queued and invoked from RunCallbacks() (like Steam does)
     FnSteamNetConnectionStatusChanged pending_connect_cb{};
+    int64 pending_connect_user_data{-1};
     std::vector<std::pair<FnSteamNetConnectionStatusChanged, SteamNetConnectionStatusChangedCallback_t>> pending_status_cbs{};
     // GameNetworkingSockets-style code sets a "current instance" pointer right before calling RunCallbacks()
     // and its static callback forwards through it -> only dispatch from the game's own RunCallbacks() call
