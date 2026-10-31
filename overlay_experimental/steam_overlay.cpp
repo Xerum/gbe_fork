@@ -858,7 +858,7 @@ void Steam_Overlay::show_test_achievement()
 
 void Steam_Overlay::build_friend_context_menu(Friend const& frd, friend_window_state& state)
 {
-    if (ImGui::BeginPopupContextItem("Friends_ContextMenu", 1)) {
+    if (ImGui::BeginPopupContextItem("Friends_ContextMenu", ImGuiPopupFlags_MouseButtonRight)) {
         // this is set to true if any button was clicked
         // otherwise, after clicking any button, the menu will be persistent
         bool close_popup = false;
