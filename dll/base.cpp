@@ -914,10 +914,113 @@ static DWORD WINAPI hook_playfab_get_full_url(LPVOID)
     return 0;
 }
 
+// custom: own Photon app from [main::photon] (see settings_photon_app_id()) for Unity (il2cpp) games using Photon Realtime,
+// also the copy inside Fusion (Fusion.Photon.Realtime): LoadBalancingPeer.OpAuthenticate()/OpAuthenticateOnce() get the
+// app id of the own app, and unless keep_auth=1 the authentication type None, so Photon doesn't check the token of the game
+// (custom authentication against PlayFab etc., which a replacement server can't produce)
+// arguments after appId/authValues are only passed through, pointer sized like on the x64 stack
+static bool (*Real_PhotonOpAuthenticate)(void *self, void *appId, void *appVersion, void *authValues, void *regionCode, uintptr_t getLobbyStatistics, const void *method) = nullptr;
+static bool (*Real_PhotonOpAuthenticateOnce)(void *self, void *appId, void *appVersion, void *authValues, void *regionCode, uintptr_t encryptionMode, uintptr_t expectedProtocol, const void *method) = nullptr;
+static void* (*il2cpp_object_get_class_fn)(void *obj) = nullptr;
+static const void* (*il2cpp_class_get_method_from_name_fn)(void *klass, const char *name, int argsCount) = nullptr;
+static void *photon_app_id_str = nullptr;
+
+static void photon_patch_auth(void *&appId, void *authValues)
+{
+    if (!photon_app_id_str) {
+        const auto &app_id = settings_photon_app_id();
+        photon_app_id_str = il2cpp_string_new_utf16_fn(app_id.c_str(), static_cast<int32_t>(app_id.size()));
+    }
+    if (photon_app_id_str) appId = photon_app_id_str;
+
+    if (authValues && !settings_photon_keep_auth()) {
+        // AuthenticationValues.AuthType = CustomAuthenticationType.None (byte 255)
+        const void *setter = il2cpp_class_get_method_from_name_fn(il2cpp_object_get_class_fn(authValues), "set_AuthType", 1);
+        if (setter && *reinterpret_cast<void * const *>(setter)) {
+            auto fn = *reinterpret_cast<void (* const *)(void *, uint8_t, const void *)>(setter);
+            fn(authValues, 255, setter);
+        }
+    }
+}
+
+static bool Mine_PhotonOpAuthenticate(void *self, void *appId, void *appVersion, void *authValues, void *regionCode, uintptr_t getLobbyStatistics, const void *method)
+{
+    photon_patch_auth(appId, authValues);
+    PRINT_DEBUG("photon OpAuthenticate with own app id");
+    return Real_PhotonOpAuthenticate(self, appId, appVersion, authValues, regionCode, getLobbyStatistics, method);
+}
+
+static bool Mine_PhotonOpAuthenticateOnce(void *self, void *appId, void *appVersion, void *authValues, void *regionCode, uintptr_t encryptionMode, uintptr_t expectedProtocol, const void *method)
+{
+    photon_patch_auth(appId, authValues);
+    PRINT_DEBUG("photon OpAuthenticateOnce with own app id");
+    return Real_PhotonOpAuthenticateOnce(self, appId, appVersion, authValues, regionCode, encryptionMode, expectedProtocol, method);
+}
+
+static DWORD WINAPI hook_photon_authenticate(LPVOID)
+{
+    HMODULE game_assembly = GetModuleHandleW(L"GameAssembly.dll");
+    if (!game_assembly || Real_PhotonOpAuthenticate || Real_PhotonOpAuthenticateOnce) return 0;
+
+    auto domain_get = (void* (*)())GetProcAddress(game_assembly, "il2cpp_domain_get");
+    auto domain_get_assemblies = (void** (*)(const void *, size_t *))GetProcAddress(game_assembly, "il2cpp_domain_get_assemblies");
+    auto assembly_get_image = (void* (*)(const void *))GetProcAddress(game_assembly, "il2cpp_assembly_get_image");
+    auto class_from_name = (void* (*)(const void *, const char *, const char *))GetProcAddress(game_assembly, "il2cpp_class_from_name");
+    il2cpp_class_get_method_from_name_fn = (decltype(il2cpp_class_get_method_from_name_fn))GetProcAddress(game_assembly, "il2cpp_class_get_method_from_name");
+    il2cpp_object_get_class_fn = (decltype(il2cpp_object_get_class_fn))GetProcAddress(game_assembly, "il2cpp_object_get_class");
+    il2cpp_string_new_utf16_fn = (decltype(il2cpp_string_new_utf16_fn))GetProcAddress(game_assembly, "il2cpp_string_new_utf16");
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name || !il2cpp_class_get_method_from_name_fn ||
+        !il2cpp_object_get_class_fn || !il2cpp_string_new_utf16_fn) {
+        PRINT_DEBUG("missing il2cpp exports");
+        return 0;
+    }
+
+    // Fusion brings its own copy of Photon Realtime, prefer it
+    for (const char *ns : { "Fusion.Photon.Realtime", "Photon.Realtime" }) {
+        size_t count = 0;
+        void **assemblies = domain_get_assemblies(domain_get(), &count);
+        for (size_t i = 0; assemblies && i < count; ++i) {
+            void *klass = class_from_name(assembly_get_image(assemblies[i]), ns, "LoadBalancingPeer");
+            if (!klass) continue;
+
+            const void *auth = il2cpp_class_get_method_from_name_fn(klass, "OpAuthenticate", 5);
+            const void *auth_once = il2cpp_class_get_method_from_name_fn(klass, "OpAuthenticateOnce", 6);
+            DetourTransactionBegin();
+            DetourUpdateThread( GetCurrentThread() );
+            if (auth && *reinterpret_cast<void * const *>(auth)) {
+                Real_PhotonOpAuthenticate = *reinterpret_cast<decltype(Real_PhotonOpAuthenticate) const *>(auth);
+                DetourAttach( reinterpret_cast<PVOID*>(&Real_PhotonOpAuthenticate), reinterpret_cast<PVOID>(Mine_PhotonOpAuthenticate) );
+            }
+            if (auth_once && *reinterpret_cast<void * const *>(auth_once)) {
+                Real_PhotonOpAuthenticateOnce = *reinterpret_cast<decltype(Real_PhotonOpAuthenticateOnce) const *>(auth_once);
+                DetourAttach( reinterpret_cast<PVOID*>(&Real_PhotonOpAuthenticateOnce), reinterpret_cast<PVOID>(Mine_PhotonOpAuthenticateOnce) );
+            }
+            [[maybe_unused]] LONG res = DetourTransactionCommit();
+            PRINT_DEBUG("hooking %s.LoadBalancingPeer.OpAuthenticate(Once), result %li", ns, res);
+            return 0;
+        }
+    }
+
+    PRINT_DEBUG("LoadBalancingPeer not found");
+    return 0;
+}
+
+static bool il2cpp_hooks_wanted()
+{
+    return settings_playfab_url().size() || settings_photon_app_id().size();
+}
+
+static DWORD WINAPI hook_il2cpp_methods(LPVOID)
+{
+    if (settings_playfab_url().size()) hook_playfab_get_full_url(nullptr);
+    if (settings_photon_app_id().size()) hook_photon_authenticate(nullptr);
+    return 0;
+}
+
 static int Mine_il2cpp_init(const char *domain_name)
 {
     int ret = Real_il2cpp_init(domain_name);
-    hook_playfab_get_full_url(nullptr);
+    hook_il2cpp_methods(nullptr);
     return ret;
 }
 
@@ -953,8 +1056,8 @@ static HMODULE WINAPI Mine_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
             return Real_LoadLibraryExW(it->second.c_str(), hFile, dwFlags);
         }
 
-        // custom: see Mine_PlayFabGetFullUrl()
-        if (name == L"gameassembly.dll" && settings_playfab_url().size()) {
+        // custom: see Mine_PlayFabGetFullUrl() and Mine_PhotonOpAuthenticate()
+        if (name == L"gameassembly.dll" && il2cpp_hooks_wanted()) {
             HMODULE module = Real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
             if (module) hook_il2cpp_init(module);
             return module;
@@ -990,7 +1093,7 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                 attach_winhttp_hooks();
             }
             // custom: see Mine_LoadLibraryExW()
-            if (!settings_dll_redirects().empty() || settings_playfab_url().size() || winhttp_late_hooks_wanted()) {
+            if (!settings_dll_redirects().empty() || il2cpp_hooks_wanted() || winhttp_late_hooks_wanted()) {
                 HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
                 Real_LoadLibraryExW = (decltype(Real_LoadLibraryExW))GetProcAddress(kernelbase ? kernelbase : GetModuleHandleW(L"kernel32.dll"), "LoadLibraryExW");
                 if (Real_LoadLibraryExW) {
@@ -1003,8 +1106,8 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
             }
             // custom: see Mine_PlayFabGetFullUrl(), without ForceInjectSteamClient the game has already initialized il2cpp
             // when it loads this dll, the hook is placed from a new thread because il2cpp must not be called under the loader lock
-            if (settings_playfab_url().size() && GetModuleHandleW(L"GameAssembly.dll")) {
-                HANDLE thread = CreateThread(nullptr, 0, hook_playfab_get_full_url, nullptr, 0, nullptr);
+            if (il2cpp_hooks_wanted() && GetModuleHandleW(L"GameAssembly.dll")) {
+                HANDLE thread = CreateThread(nullptr, 0, hook_il2cpp_methods, nullptr, 0, nullptr);
                 if (thread) CloseHandle(thread);
             }
             // custom: see Mine_getaddrinfo()
