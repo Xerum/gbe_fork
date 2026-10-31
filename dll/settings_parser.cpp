@@ -2300,6 +2300,8 @@ const std::map<std::wstring, std::wstring>& settings_dll_redirects()
 // custom: host names the game should resolve to another address, e.g. a self-hosted Photon server
 // [main::host_redirect]
 // ns.exitgames.com=192.168.178.43
+// *.xboxlive.com=127.0.0.3      (xboxlive.com and every sub domain)
+// *=127.0.0.3                   (every other host name containing a dot, ip literals are never redirected)
 const std::map<std::string, std::string>& settings_host_redirects()
 {
     static std::map<std::string, std::string> redirects{};
@@ -2321,6 +2323,37 @@ const std::map<std::string, std::string>& settings_host_redirects()
     }
 
     return redirects;
+}
+
+// custom: log of the redirected host names, to find out which services a game uses
+// [main::host_redirect_log]
+// path=host_redirect.log
+// relative paths are resolved against the game's steam_settings folder
+const std::string& settings_host_redirect_log()
+{
+    static std::string path{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return path;
+    parsed = true;
+
+    std::string val = ini.GetValue("main::host_redirect_log", "path", "");
+    if (val.size()) {
+        path = common_helpers::to_absolute(val, Local_Storage::get_game_settings_path());
+        PRINT_DEBUG("host redirect log '%s'", path.c_str());
+    }
+
+    return path;
+}
+
+// custom: let the WinHTTP requests of the game accept any server certificate, for self-made replacements of web services
+// [main::winhttp]
+// ignore_cert_errors=1
+bool settings_winhttp_ignore_cert_errors()
+{
+    load_all_config_settings();
+    return ini.GetBoolValue("main::winhttp", "ignore_cert_errors", false);
 }
 
 // custom: server replacing PlayFab in Unity games using the PlayFab SDK
