@@ -16,6 +16,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "dll/steam_networking_utils.h"
+#include "dll/steam_networking_sockets.h"
 
 void Steam_Networking_Utils::steam_callback(void *object, Common_Message *msg)
 {
@@ -363,6 +364,22 @@ bool Steam_Networking_Utils::SetConfigValue( ESteamNetworkingConfigValue eValue,
 {
     PRINT_DEBUG("TODO %i %i " "%" PRIdPTR " %i %p", eValue, eScopeType, scopeObj, eDataType, pArg);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+
+    // custom: connection status function callback (global, per listen socket or per connection)
+    if (eValue == k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged && eDataType == k_ESteamNetworkingConfig_Ptr) {
+        FnSteamNetConnectionStatusChanged fn = pArg ? *(FnSteamNetConnectionStatusChanged const *)pArg : nullptr;
+        PRINT_DEBUG("connection status function callback %p scope %i obj %" PRIdPTR, (void *)fn, eScopeType, scopeObj);
+        if (eScopeType == k_ESteamNetworkingConfig_Global) {
+            gbe_global_conn_status_cb = fn;
+        } else if (gbe_sns_config_sbcs && eScopeType == k_ESteamNetworkingConfig_ListenSocket) {
+            for (auto &ls : gbe_sns_config_sbcs->listen_sockets) {
+                if (ls.socket_id == (HSteamListenSocket)scopeObj) ls.status_cb = fn;
+            }
+        } else if (gbe_sns_config_sbcs && eScopeType == k_ESteamNetworkingConfig_Connection) {
+            auto it = gbe_sns_config_sbcs->connect_sockets.find((HSteamNetConnection)scopeObj);
+            if (it != gbe_sns_config_sbcs->connect_sockets.end()) it->second.status_cb = fn;
+        }
+    }
     return true;
 }
 
