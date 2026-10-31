@@ -17,6 +17,8 @@
 
 #include "dll/base.h"
 #include "dll/settings_parser.h"
+#include <array>
+#include <utility>
 
 #ifndef EMU_RELEASE_BUILD
 #include "dbg_log/dbg_log.hpp"
@@ -1002,15 +1004,92 @@ static DWORD WINAPI hook_photon_authenticate(LPVOID)
     return 0;
 }
 
+// custom: [main::il2cpp_skip_if_destroyed] (see settings_il2cpp_skip_if_destroyed()), instance methods of UnityEngine.Object
+// subclasses are skipped when called on a destroyed object: its native object pointer m_CachedPtr (first field, right
+// after the il2cpp object header) is null then. Example: We Were Here Together's Vivox login callback reaches
+// EngagementScreenController.OnStepCompleted after the main menu replaced the engagement screen; the exception thrown
+// there aborts Vivox' login state change, the login never completes and the voice chat/messages stay logged out.
+// all arguments are passed through pointer sized (x64), unused ones are harmless
+typedef uintptr_t (*il2cpp_generic_fn)(void *self, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7);
+constexpr int skip_if_destroyed_slots = 8;
+static il2cpp_generic_fn Real_skip_if_destroyed[skip_if_destroyed_slots] = {};
+
+template<int N>
+static uintptr_t Mine_skip_if_destroyed(void *self, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7)
+{
+    if (self && !*reinterpret_cast<void **>(reinterpret_cast<char *>(self) + 2 * sizeof(void *))) {
+        PRINT_DEBUG("il2cpp skip if destroyed: slot %i skipped", N);
+        return 0;
+    }
+    return Real_skip_if_destroyed[N](self, a1, a2, a3, a4, a5, a6, a7);
+}
+
+template<int... N>
+static constexpr std::array<il2cpp_generic_fn, sizeof...(N)> make_skip_if_destroyed_hooks(std::integer_sequence<int, N...>)
+{
+    return { &Mine_skip_if_destroyed<N>... };
+}
+
+static void hook_il2cpp_skip_if_destroyed()
+{
+    static bool done = false;
+    const auto &methods = settings_il2cpp_skip_if_destroyed();
+    if (done || methods.empty()) return;
+
+    HMODULE game_assembly = GetModuleHandleW(L"GameAssembly.dll");
+    if (!game_assembly) return;
+    auto domain_get = (void* (*)())GetProcAddress(game_assembly, "il2cpp_domain_get");
+    auto domain_get_assemblies = (void** (*)(const void *, size_t *))GetProcAddress(game_assembly, "il2cpp_domain_get_assemblies");
+    auto assembly_get_image = (void* (*)(const void *))GetProcAddress(game_assembly, "il2cpp_assembly_get_image");
+    auto class_from_name = (void* (*)(const void *, const char *, const char *))GetProcAddress(game_assembly, "il2cpp_class_from_name");
+    auto class_get_method_from_name = (const void* (*)(void *, const char *, int))GetProcAddress(game_assembly, "il2cpp_class_get_method_from_name");
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name || !class_get_method_from_name) {
+        PRINT_DEBUG("missing il2cpp exports");
+        return;
+    }
+    done = true;
+
+    static const auto hooks = make_skip_if_destroyed_hooks(std::make_integer_sequence<int, skip_if_destroyed_slots>{});
+    int slot = 0;
+    size_t count = 0;
+    void **assemblies = domain_get_assemblies(domain_get(), &count);
+    for (const auto &full : methods) {
+        if (slot >= skip_if_destroyed_slots) break;
+        auto method_sep = full.rfind('.');
+        if (method_sep == std::string::npos) continue;
+        std::string class_full = full.substr(0, method_sep), method_name = full.substr(method_sep + 1);
+        auto class_sep = class_full.rfind('.');
+        std::string ns = class_sep == std::string::npos ? std::string() : class_full.substr(0, class_sep);
+        std::string class_name = class_sep == std::string::npos ? class_full : class_full.substr(class_sep + 1);
+
+        for (size_t i = 0; assemblies && i < count; ++i) {
+            void *klass = class_from_name(assembly_get_image(assemblies[i]), ns.c_str(), class_name.c_str());
+            if (!klass) continue;
+            const void *method = class_get_method_from_name(klass, method_name.c_str(), -1);
+            if (!method || !*reinterpret_cast<void * const *>(method)) break;
+
+            Real_skip_if_destroyed[slot] = *reinterpret_cast<il2cpp_generic_fn const *>(method);
+            DetourTransactionBegin();
+            DetourUpdateThread( GetCurrentThread() );
+            DetourAttach( reinterpret_cast<PVOID*>(&Real_skip_if_destroyed[slot]), reinterpret_cast<PVOID>(hooks[slot]) );
+            [[maybe_unused]] LONG res = DetourTransactionCommit();
+            PRINT_DEBUG("hooking '%s' (skip if destroyed, slot %i), result %li", full.c_str(), slot, res);
+            ++slot;
+            break;
+        }
+    }
+}
+
 static bool il2cpp_hooks_wanted()
 {
-    return settings_playfab_url().size() || settings_photon_app_id().size();
+    return settings_playfab_url().size() || settings_photon_app_id().size() || !settings_il2cpp_skip_if_destroyed().empty();
 }
 
 static DWORD WINAPI hook_il2cpp_methods(LPVOID)
 {
     if (settings_playfab_url().size()) hook_playfab_get_full_url(nullptr);
     if (settings_photon_app_id().size()) hook_photon_authenticate(nullptr);
+    hook_il2cpp_skip_if_destroyed();
     return 0;
 }
 
