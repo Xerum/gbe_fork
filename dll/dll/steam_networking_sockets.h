@@ -137,6 +137,12 @@ public ISteamNetworkingSockets
     // custom: function callbacks are queued and invoked from RunCallbacks() (like Steam does)
     FnSteamNetConnectionStatusChanged pending_connect_cb{};
     std::vector<std::pair<FnSteamNetConnectionStatusChanged, SteamNetConnectionStatusChangedCallback_t>> pending_status_cbs{};
+    // GameNetworkingSockets-style code sets a "current instance" pointer right before calling RunCallbacks()
+    // and its static callback forwards through it -> only dispatch from the game's own RunCallbacks() call
+    // (fallback: dispatch from the emu's run loop if the game never calls it)
+    bool explicit_runcallbacks_seen{};
+    void run_connection_retries();
+    void dispatch_status_cbs();
 
     void Callback(Common_Message *msg);
 
