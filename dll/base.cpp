@@ -1244,6 +1244,53 @@ static HMODULE WINAPI Mine_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
     return module;
 }
 
+// custom: apply the in-memory byte patches from [main::exe_patch] (see settings_exe_patches()) to the game exe or a named
+// module; the module must already be mapped (with ForceInjectSteamClient the game exe is, as this dll loads before its code)
+static void apply_exe_patches()
+{
+    const auto &patches = settings_exe_patches();
+    if (patches.empty()) return;
+
+    for (const auto &p : patches) {
+        HMODULE mod = p.module.empty() ? GetModuleHandleW(nullptr) : GetModuleHandleA(p.module.c_str());
+        if (!mod) {
+            PRINT_DEBUG("exe_patch '%s': module '%s' not loaded", p.label.c_str(), p.module.c_str());
+            continue;
+        }
+
+        auto base = reinterpret_cast<uint8_t*>(mod);
+        auto *dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        auto *nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        size_t image_size = nt->OptionalHeader.SizeOfImage;
+        const size_t n = p.find.size();
+        if (n > image_size) continue;
+
+        bool done = false;
+        for (size_t i = 0; i + n <= image_size && !done; ++i) {
+            bool match = true;
+            for (size_t j = 0; j < n; ++j) {
+                if (p.find[j] >= 0 && base[i + j] != static_cast<uint8_t>(p.find[j])) { match = false; break; }
+            }
+            if (!match) continue;
+
+            DWORD old_prot = 0;
+            if (VirtualProtect(base + i, n, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                for (size_t j = 0; j < n; ++j) {
+                    if (p.replace[j] >= 0) base[i + j] = static_cast<uint8_t>(p.replace[j]);
+                }
+                DWORD tmp = 0;
+                VirtualProtect(base + i, n, old_prot, &tmp);
+                FlushInstructionCache(GetCurrentProcess(), base + i, n);
+                PRINT_DEBUG("exe_patch '%s' applied at +0x%zx", p.label.c_str(), i);
+            } else {
+                PRINT_DEBUG("exe_patch '%s': VirtualProtect failed at +0x%zx", p.label.c_str(), i);
+            }
+            done = true;
+        }
+        if (!done) PRINT_DEBUG("exe_patch '%s': pattern not found", p.label.c_str());
+    }
+}
+
 static bool network_functions_attached = false;
 static bool loadlibrary_attached = false;
 static bool host_functions_attached = false;
@@ -1297,6 +1344,8 @@ BOOL WINAPI DllMain( HINSTANCE, DWORD dwReason, LPVOID )
                 DetourAttach( reinterpret_cast<PVOID*>(&Real_GetAddrInfoExW), reinterpret_cast<PVOID>(Mine_GetAddrInfoExW) );
                 host_functions_attached = DetourTransactionCommit() == NO_ERROR;
             }
+            // custom: in-memory byte patches of the game exe / a module, see apply_exe_patches()
+            apply_exe_patches();
             load_crack_dll();
             load_dlls();
         break;

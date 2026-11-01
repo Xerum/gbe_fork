@@ -2433,6 +2433,84 @@ const std::vector<std::pair<std::string, std::string>>& settings_il2cpp_redirect
     return redirects;
 }
 
+// custom: in-memory byte patch of a loaded module (the game exe by default), e.g. to disable a token/signature check
+// [main::exe_patch]
+// conan_fls_token = 41 83 FE 01 0F 94 C0 => B0 01 90 90 90 90 90
+// other_game      = SomeGame.dll| 74 ?? => EB ??   (?? in find = wildcard, ?? in replace = keep original byte)
+const std::vector<Exe_Patch>& settings_exe_patches()
+{
+    static std::vector<Exe_Patch> patches{};
+    static bool parsed = false;
+
+    load_all_config_settings();
+    if (parsed) return patches;
+    parsed = true;
+
+    std::list<CSimpleIniA::Entry> names{};
+    if (!ini.GetAllKeys("main::exe_patch", names) || names.empty()) return patches;
+
+    auto parse_bytes = [](const std::string &s, std::vector<int> &out) -> bool {
+        std::string tok;
+        auto flush = [&]() -> bool {
+            if (tok.empty()) return true;
+            if (tok == "??" || tok == "?") { out.push_back(-1); tok.clear(); return true; }
+            if (tok.size() != 2) return false;
+            char *end = nullptr;
+            long v = strtol(tok.c_str(), &end, 16);
+            if (end != tok.c_str() + 2 || v < 0 || v > 255) return false;
+            out.push_back((int)v);
+            tok.clear();
+            return true;
+        };
+        for (char c : s) {
+            if (c == ' ' || c == ',' || c == '\t') { if (!flush()) return false; }
+            else tok.push_back(c);
+        }
+        return flush();
+    };
+    auto trim = [](std::string v) -> std::string {
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+        return v;
+    };
+
+    for (const auto &name : names) {
+        auto val_ptr = ini.GetValue("main::exe_patch", name.pItem);
+        if (!val_ptr || !val_ptr[0]) continue;
+
+        std::string val(val_ptr);
+        Exe_Patch patch{};
+        patch.label = name.pItem;
+
+        auto bar = val.find('|');
+        auto arrow = val.find("=>");
+        if (bar != std::string::npos && (arrow == std::string::npos || bar < arrow)) {
+            patch.module = common_helpers::to_lower(trim(val.substr(0, bar)));
+            val = val.substr(bar + 1);
+            arrow = val.find("=>");
+        }
+
+        if (arrow == std::string::npos) {
+            PRINT_DEBUG("exe_patch '%s': missing '=>'", patch.label.c_str());
+            continue;
+        }
+        if (!parse_bytes(val.substr(0, arrow), patch.find) ||
+            !parse_bytes(val.substr(arrow + 2), patch.replace)) {
+            PRINT_DEBUG("exe_patch '%s': bad hex", patch.label.c_str());
+            continue;
+        }
+        if (patch.find.empty() || patch.find.size() != patch.replace.size()) {
+            PRINT_DEBUG("exe_patch '%s': find/replace length mismatch (%zu vs %zu)", patch.label.c_str(), patch.find.size(), patch.replace.size());
+            continue;
+        }
+
+        PRINT_DEBUG("exe_patch '%s' module '%s', %zu bytes", patch.label.c_str(), patch.module.c_str(), patch.find.size());
+        patches.push_back(std::move(patch));
+    }
+
+    return patches;
+}
+
 // custom: instance methods of UnityEngine.Object subclasses in il2cpp games that are skipped when called on an already
 // destroyed object (m_CachedPtr == null), e.g. callbacks that arrive after a scene change and would throw
 // [main::il2cpp_skip_if_destroyed]

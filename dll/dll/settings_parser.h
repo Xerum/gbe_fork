@@ -52,6 +52,17 @@ const std::vector<std::string>& settings_il2cpp_skip_if_destroyed();
 // custom: [main::il2cpp_redirect] Namespace.Class.Method=OtherMethod, calls the parameterless OtherMethod of the same class instead
 const std::vector<std::pair<std::string, std::string>>& settings_il2cpp_redirects();
 
+// custom: [main::exe_patch] in-memory byte patch of a loaded module (the game exe by default)
+// each entry: find bytes => replace bytes (same number of byte tokens; "??" = wildcard in find / keep original in replace),
+// optionally prefixed with "module.dll|". find and replace must be the same length.
+struct Exe_Patch {
+    std::string label;
+    std::string module;      // empty = main executable
+    std::vector<int> find;   // -1 = wildcard
+    std::vector<int> replace; // -1 = keep original byte
+};
+const std::vector<Exe_Patch>& settings_exe_patches();
+
 enum class SettingsItf {
    CLIENT,
    GAMESERVER_STATS,
