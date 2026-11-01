@@ -1,6 +1,6 @@
 # Fork-only workflow: every push to "dev" builds the Windows emu and replaces the
 # "dev-build" pre-release on the Releases page. Stable releases still come from release.yml
-# (push a "release-*" tag). Uses the VS2022 build because its deps are cached.
+# (push a "release-*" tag). Uses the VS2026 build (first run builds the deps cache, takes long).
 name: "Dev build (Windows)"
 
 on:
@@ -28,12 +28,12 @@ env:
 jobs:
   emu-win-all:
     name: "Emu win all"
-    uses: "./.github/workflows/emu-build-all-win-vs22.yml"
+    uses: "./.github/workflows/emu-build-all-win.yml"
 
   emu-win-dev-release:
     name: "Package and publish dev build"
     needs: ["emu-win-all"]
-    runs-on: "windows-2022"
+    runs-on: "windows-2025-vs2026"
     steps:
       # on Windows Git will auto change line ending to CRLF, not preferable
       - name: "Ensure LF line ending"
@@ -58,18 +58,18 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: "build/win"
-          pattern: "emu-win-vs22-*-${{ github.sha }}"
+          pattern: "emu-win-*-${{ github.sha }}"
           merge-multiple: true
 
       - name: "Package build (release)"
         shell: "cmd"
         working-directory: "${{ github.workspace }}"
-        run: package_win.bat vs2022\release
+        run: package_win.bat vs2026\release
 
       - name: "Package build (debug)"
         shell: "cmd"
         working-directory: "${{ github.workspace }}"
-        run: package_win.bat vs2022\debug 1
+        run: package_win.bat vs2026\debug 1
 
       - name: "Replace dev-build pre-release"
         shell: "pwsh"
@@ -77,8 +77,8 @@ jobs:
         env:
           GH_TOKEN: "${{ github.token }}"
         run: |
-          $files = Get-ChildItem "build/package/win/vs2022" -Filter *.7z | ForEach-Object FullName
-          if (-not $files) { throw "no packages found in build/package/win/vs2022" }
+          $files = Get-ChildItem "build/package/win/vs2026" -Filter *.7z | ForEach-Object FullName
+          if (-not $files) { throw "no packages found in build/package/win/vs2026" }
           gh release view $env:RELEASE_TAG 2>$null
           if ($LASTEXITCODE -eq 0) { gh release delete $env:RELEASE_TAG --cleanup-tag --yes }
           $global:LASTEXITCODE = 0
