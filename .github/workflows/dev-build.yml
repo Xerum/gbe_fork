@@ -1,0 +1,96 @@
+# Fork-only workflow: every push to "dev" builds the Windows emu and replaces the
+# "dev-build" pre-release on the Releases page. Stable releases still come from release.yml
+# (push a "release-*" tag).
+name: "Dev build (Windows)"
+
+on:
+  push:
+    branches:
+      - "dev"
+    paths-ignore:
+      - "**/*.md"
+      - "dev.notes"
+  workflow_dispatch:
+    # allows manual trigger
+
+permissions:
+  contents: "write"
+
+# a newer push cancels a still running build
+concurrency:
+  group: "dev-build"
+  cancel-in-progress: true
+
+env:
+  THIRD_PARTY_BASE_DIR: "third-party"
+  RELEASE_TAG: "dev-build"
+
+jobs:
+  emu-win-all:
+    name: "Emu win all"
+    uses: "./.github/workflows/emu-build-all-win.yml"
+
+  emu-win-dev-release:
+    name: "Package and publish dev build"
+    needs: ["emu-win-all"]
+    runs-on: "windows-2025-vs2026"
+    steps:
+      # on Windows Git will auto change line ending to CRLF, not preferable
+      - name: "Ensure LF line ending"
+        shell: "cmd"
+        working-directory: "${{ github.workspace }}"
+        run: |
+          git config --local core.autocrlf false
+          git config --system core.autocrlf false
+          git config --global core.autocrlf false
+
+      # we need branch because it has package scripts
+      - name: "Checkout branch"
+        uses: actions/checkout@v6
+
+      - name: "Clone third-party deps (deps/win)"
+        uses: actions/checkout@v6
+        with:
+          ref: "third-party/deps/win"
+          path: "${{env.THIRD_PARTY_BASE_DIR}}/deps/win"
+
+      - name: "Download emu build artifacts (Win)"
+        uses: actions/download-artifact@v8
+        with:
+          path: "build/win"
+          pattern: "emu-win-*-${{ github.sha }}"
+          merge-multiple: true
+
+      - name: "Package build (release)"
+        shell: "cmd"
+        working-directory: "${{ github.workspace }}"
+        run: package_win.bat vs2026\release
+
+      - name: "Package build (debug)"
+        shell: "cmd"
+        working-directory: "${{ github.workspace }}"
+        run: package_win.bat vs2026\debug 1
+
+      - name: "Replace dev-build pre-release"
+        shell: "pwsh"
+        working-directory: "${{ github.workspace }}"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          $files = Get-ChildItem "build/package/win/vs2026" -Filter *.7z | ForEach-Object FullName
+          if (-not $files) { throw "no packages found in build/package/win/vs2026" }
+          gh release view $env:RELEASE_TAG 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release delete $env:RELEASE_TAG --cleanup-tag --yes }
+          $global:LASTEXITCODE = 0
+          $date = Get-Date -AsUTC -Format "yyyy-MM-dd HH:mm 'UTC'"
+          $msg = (git log -1 --format=%s).Trim()
+          $notes = @"
+          **Automatically built from the latest ``dev`` branch. Not a stable release.**
+
+          - Build date: $date
+          - Commit: ${{ github.sha }}
+          - Last change: $msg
+
+          ``emu-win-release.7z`` = normal build, ``emu-win-debug.7z`` = debug build with logs.
+          "@
+          gh release create $env:RELEASE_TAG @files --prerelease --target "${{ github.sha }}" --title "Development build" --notes $notes
